@@ -1,0 +1,39 @@
+{
+  "item": {
+    "game": "poe1",
+    "item_class": "Bows",
+    "rarity": "Rare",
+    "name": "Death Whisper",
+    "base_type": "Spine Bow",
+    "item_level": 32,
+    "links": 3,
+    "corrupted": true,
+    "mods": [
+      {
+        "text": "+45 to Dexterity",
+        "mod_type": "Explicit",
+        "template": "# to Dexterity",
+        "rolls": [45.0],
+        "stat_ref": "+# to Dexterity",
+        "trade_ids": ["explicit.stat_3261801346"]
+      },
+      {
+        "text": "+80 to maximum Life",
+        "mod_type": "Explicit",
+        "template": "# to maximum Life",
+        "rolls": [80.0],
+        "stat_ref": "+# to maximum Life",
+        "trade_ids": ["explicit.stat_3299347043"]
+      }
+    ],
+    "raw_text": "Item Class: Bows\nRarity: Rare\nDeath Whisper\nSpine Bow\n--------\nItem Level: 32\n--------\n+45 to Dexterity\n+80 to maximum Life\n--------\nCorrupted\n"
+  },
+  "quotes": [
+    { "amount": 1.0, "currency": "chaos", "source": "trade" },
+    { "amount": 1.0, "currency": "chaos", "source": "trade" },
+    { "amount": 1.0, "currency": "chaos", "source": "trade" },
+    { "amount": 3.0, "currency": "chaos", "source": "trade" },
+    { "amount": 5.0, "currency": "chaos", "source": "trade" }
+  ],
+  "total": 8123
+}

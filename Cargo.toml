@@ -1,0 +1,21 @@
+[package]
+name = "poechk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Path of Exile price-check overlay for the COSMIC desktop"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.6.1", features = ["derive"] }
+directories = "6.0.0"
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", version = "1.0.0", default-features = false, features = ["tokio", "wayland", "winit"] }
+regex = "1.12.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ureq = { version = "3.3.0", features = ["json"] }

@@ -1,0 +1,12 @@
+# poechk builds on the rustup-managed "stable" toolchain.
+#
+# Do NOT build with Fedora's system Rust at /usr/bin/cargo: its distro rustc
+# mis-detects as nightly-capable, so build scripts (proc-macro2, anyhow, ...)
+# switch on nightly-only code and the build fails with E0554
+# ("`#![feature]` may not be used on the stable release channel").
+#
+# Use the rustup shim (~/.cargo/bin/cargo), which honours this file. Make sure
+# ~/.cargo/bin precedes /usr/bin on PATH, or invoke ~/.cargo/bin/cargo directly.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
