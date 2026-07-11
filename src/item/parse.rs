@@ -8,7 +8,7 @@
 //! (suffix) and advanced (`{ … }` info line) clipboard formats.
 
 use crate::data::{ItemIndex, StatIndex};
-use crate::item::mods::ModType;
+use crate::item::mods::{ModType, Slot};
 use crate::item::{Game, Influence, ParsedItem, Rarity, mods};
 
 pub const ITEM_CLASS_PREFIX: &str = "Item Class: ";
@@ -103,8 +103,10 @@ pub fn parse_item(
     items: &ItemIndex,
 ) -> Result<ParsedItem, ParseError> {
     let mut item = parse_name_plate(text, game)?;
+    // Resolve the category first: local/global stat variants depend on it.
+    item.category = resolve_category(&item, items);
     let sections = split_sections(text);
-    let mut context: Option<ModType> = None;
+    let mut context: Option<(ModType, Option<Slot>)> = None;
 
     for section in sections.iter().skip(1) {
         // The weapon/armour base-stats block holds Quality alongside the
@@ -116,10 +118,14 @@ pub fn parse_item(
             continue;
         }
         for line in section.iter().map(|l| l.trim()) {
-            // An advanced `{ … Modifier … }` info line sets the type for the
-            // mods that follow it.
-            if let Some(ty) = ModType::from_info_line(line) {
-                context = Some(ty);
+            // An advanced `{ … Modifier … }` info line sets the type and slot
+            // for the mods that follow it.
+            if let Some(info) = ModType::from_info_line(line) {
+                context = Some(info);
+                continue;
+            }
+            // Fully parenthesised lines are reminder/help text, not mods.
+            if line.starts_with('(') && line.ends_with(')') {
                 continue;
             }
             if parse_meta_value(line, &mut item) || parse_meta_flag(line, &mut item) {
@@ -129,7 +135,7 @@ pub fn parse_item(
             if line.contains(": ") || line.ends_with(':') {
                 continue;
             }
-            match mods::parse_mod(line, stats, context) {
+            match mods::parse_mod(line, stats, context, item.category.as_deref()) {
                 Some(parsed) => item.mods.push(parsed),
                 // Only surface unresolved lines that look like a rollable mod (a
                 // space and a digit) — skips unique flavour text and lone
@@ -143,7 +149,6 @@ pub fn parse_item(
         context = None;
     }
 
-    item.category = resolve_category(&item, items);
     Ok(item)
 }
 
@@ -161,6 +166,7 @@ fn parse_meta_value(line: &str, item: &mut ParsedItem) -> bool {
         return true;
     }
     if let Some(rest) = line.strip_prefix("Sockets: ") {
+        item.sockets = Some(socket_count(rest));
         item.links = Some(max_links(rest));
         return true;
     }
@@ -203,6 +209,14 @@ fn max_links(sockets: &str) -> u8 {
         .unwrap_or(0)
 }
 
+/// Total socket count in a `Sockets:` value (e.g. "R-G-G R" -> 4).
+fn socket_count(sockets: &str) -> u8 {
+    sockets
+        .split_whitespace()
+        .map(|group| group.split('-').count() as u8)
+        .sum()
+}
+
 /// Resolve the item's trade category from its base type, when known.
 fn resolve_category(item: &ParsedItem, items: &ItemIndex) -> Option<String> {
     items
@@ -241,7 +255,7 @@ fn is_base_stats_section(section: &[&str]) -> bool {
 mod tests {
     use super::*;
     use crate::data::{load_items, load_stats};
-    use crate::item::mods::ModType;
+    use crate::item::mods::{ModType, Slot};
     use crate::item::{Game, Rarity};
 
     const CHAOS_ORB: &str = "Item Class: Stackable Currency\nRarity: Currency\nChaos Orb\n--------\nStack Size: 20/10\n--------\nReforges a rare item with new random modifiers\n";
@@ -371,9 +385,108 @@ Fractured Item
             "Attacks with this Weapon Penetrate #% Elemental Resistances"
         ));
 
+        // Prefix/suffix slots come from the info lines.
+        assert!(item.mods.iter().any(|m| {
+            m.stat_ref == "Adds # to # Cold Damage" && m.slot == Some(Slot::Prefix)
+        }));
+        assert!(item.mods.iter().any(|m| {
+            m.stat_ref == "#% increased Attack Speed" && m.slot == Some(Slot::Suffix)
+        }));
+        // The implicit has no slot.
+        assert!(item.mods.iter().any(|m| {
+            m.mod_type == ModType::Implicit && m.slot.is_none()
+        }));
+
         // The weapon-type header is skipped; `{ … }` lines are consumed.
         assert!(!item.unknown_mods.iter().any(|l| l == "One Handed Sword"));
         assert!(!item.unknown_mods.iter().any(|l| l.starts_with('{')));
+    }
+
+    #[test]
+    fn parses_eldritch_chest_with_reminder_text_and_sockets() {
+        const CHEST: &str = r#"Item Class: Body Armours
+Rarity: Rare
+Victory Coat
+Conquest Lamellar
+--------
+Quality: +20% (augmented)
+Armour: 2401 (augmented)
+Evasion Rating: 2501 (augmented)
+--------
+Requirements:
+Level: 84
+Str: 173
+--------
+Sockets: R-G-G-R-G-R
+--------
+Item Level: 86
+--------
+{ Searing Exarch Implicit Modifier (Lesser) }
+Gain an Endurance Charge every 15 seconds
+{ Eater of Worlds Implicit Modifier (Greater) — Attack }
+Melee Hits have 9(8-9)% chance to Fortify
+(Fortifying grants an amount of Fortification based on the Damage of the Hit)
+(Take 1% less Damage from Hits per Fortification. Maximum 20 Fortification. Fortification lasts 6 seconds)
+--------
+{ Prefix Modifier "Versatile" (Tier: 1) — Defences, Armour, Evasion }
++326(301-375) to Armour
++374(301-375) to Evasion Rating
+{ Prefix Modifier "Vigorous" (Tier: 3) — Life }
++159(145-159) to maximum Life
+{ Master Crafted Prefix Modifier "Upgraded" (Rank: 3) — Defences, Armour, Evasion }
+74(56-74)% increased Armour and Evasion
+{ Fractured Suffix Modifier "of Nullification" (Tier: 1) }
++22(20-22)% chance to Suppress Spell Damage
+(40% of Damage from Suppressed Hits and Ailments they inflict is prevented)
+{ Suffix Modifier "of Ephij" (Tier: 1) — Elemental, Lightning, Resistance }
++48(46-48)% to Lightning Resistance
+--------
+Split
+Searing Exarch Item
+Eater of Worlds Item
+--------
+Fractured Item
+"#;
+        let stats = load_stats();
+        let items = load_items();
+        let item = parse_item(CHEST, Game::Poe1, &stats, &items).unwrap();
+
+        // 6 sockets, 6-linked.
+        assert_eq!(item.sockets, Some(6));
+        assert_eq!(item.links, Some(6));
+        assert!(item.split);
+        assert!(item.fractured);
+
+        // Reminder/help lines in parentheses are not mods and not "unknown".
+        assert!(
+            !item
+                .unknown_mods
+                .iter()
+                .any(|l| l.starts_with('(') && l.ends_with(')')),
+            "parenthesised reminder text leaked: {:?}",
+            item.unknown_mods
+        );
+
+        // Flat armour on a body armour resolves to the LOCAL trade stat.
+        assert_eq!(item.category.as_deref(), Some("Body Armour"));
+        assert!(item.mods.iter().any(|m| {
+            m.text.contains("to Armour")
+                && m.trade_ids.contains(&"explicit.stat_3484657501".to_string())
+        }));
+
+        // Eldritch implicits type as implicits; crafted/fractured keep types.
+        assert!(item.mods.iter().any(|m| m.mod_type == ModType::Implicit));
+        assert!(
+            item.mods
+                .iter()
+                .any(|m| m.mod_type == ModType::Crafted
+                    && m.stat_ref == "#% increased Armour and Evasion")
+        );
+        assert!(
+            item.mods
+                .iter()
+                .any(|m| m.mod_type == ModType::Fractured && m.slot == Some(Slot::Suffix))
+        );
     }
 
     #[test]

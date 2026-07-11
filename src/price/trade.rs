@@ -34,6 +34,9 @@ const FETCH_LIMIT: usize = 10;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FilterSpec {
     pub enabled: bool,
+    /// Search the mod as a plain explicit instead of its special type
+    /// (fractured/crafted/…), matching it on any item regardless of provenance.
+    pub as_explicit: bool,
     pub min: Option<f64>,
     pub max: Option<f64>,
 }
@@ -81,6 +84,10 @@ pub struct MiscFilters {
     pub status: Status,
     /// None = any; Some(true) = corrupted only; Some(false) = uncorrupted only.
     pub corrupted: Option<bool>,
+    /// Minimum total socket count.
+    pub sockets_min: Option<u8>,
+    /// Minimum size of the largest linked group.
+    pub links_min: Option<u8>,
 }
 
 /// The outcome of a price search: the search id (for the trade URL), the total
@@ -113,10 +120,29 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
     {
         query["name"] = json!(name);
     }
+    let mut filter_groups = serde_json::Map::new();
     if let Some(corrupted) = misc.corrupted {
         let option = if corrupted { "true" } else { "false" };
-        query["filters"] =
-            json!({ "misc_filters": { "filters": { "corrupted": { "option": option } } } });
+        filter_groups.insert(
+            "misc_filters".to_string(),
+            json!({ "filters": { "corrupted": { "option": option } } }),
+        );
+    }
+    if misc.sockets_min.is_some() || misc.links_min.is_some() {
+        let mut socket_filters = serde_json::Map::new();
+        if let Some(sockets) = misc.sockets_min {
+            socket_filters.insert("sockets".to_string(), json!({ "min": sockets }));
+        }
+        if let Some(links) = misc.links_min {
+            socket_filters.insert("links".to_string(), json!({ "min": links }));
+        }
+        filter_groups.insert(
+            "socket_filters".to_string(),
+            json!({ "filters": Value::Object(socket_filters) }),
+        );
+    }
+    if !filter_groups.is_empty() {
+        query["filters"] = Value::Object(filter_groups);
     }
 
     json!({ "query": query, "sort": { "price": "asc" } })
@@ -191,13 +217,15 @@ fn save_league_cache(ids: &[String]) {
 
 /// Default filters: a unique's affix rolls vary widely, so it is searched by
 /// name with affixes off; everything else filters on all resolved affixes at
-/// their current roll (min = roll, no max).
+/// their current roll (min = roll, no max). Crafted mods start disabled — any
+/// buyer can re-craft them, so they shouldn't constrain the search.
 pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
     let enabled = item.rarity != Some(Rarity::Unique);
     item.mods
         .iter()
         .map(|m| FilterSpec {
-            enabled,
+            enabled: enabled && m.mod_type != crate::item::mods::ModType::Crafted,
+            as_explicit: false,
             min: m.roll().map(f64::floor),
             max: None,
         })
@@ -206,7 +234,12 @@ pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
 
 /// One trade stat filter for a resolved mod, or `None` if it has no trade id.
 fn stat_filter(m: &crate::item::mods::ParsedMod, spec: &FilterSpec) -> Option<Value> {
-    let id = m.trade_ids.first()?;
+    let ids = if spec.as_explicit && !m.explicit_ids.is_empty() {
+        &m.explicit_ids
+    } else {
+        &m.trade_ids
+    };
+    let id = ids.first()?;
     let mut filter = json!({ "id": id, "disabled": !spec.enabled });
     if spec.enabled {
         let mut value = serde_json::Map::new();
@@ -417,11 +450,86 @@ mod tests {
         ParsedMod {
             text: stat_ref.to_string(),
             mod_type: ModType::Explicit,
+            slot: None,
             template: stat_ref.to_string(),
             rolls: roll.map(|r| vec![r]).unwrap_or_default(),
             stat_ref: stat_ref.to_string(),
             trade_ids: vec![id.to_string()],
+            explicit_ids: vec![id.to_string()],
         }
+    }
+
+    #[test]
+    fn socket_filters_and_crafted_default_off() {
+        let mut crafted = mod_with("#% increased Armour and Evasion", "crafted.stat_x", Some(74.0));
+        crafted.mod_type = ModType::Crafted;
+        let item = ParsedItem {
+            base_type: "Conquest Lamellar".to_string(),
+            rarity: Some(Rarity::Rare),
+            sockets: Some(6),
+            links: Some(6),
+            mods: vec![
+                mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(159.0)),
+                crafted,
+            ],
+            ..Default::default()
+        };
+
+        // Crafted mods default to disabled; normal explicits stay on.
+        let defaults = default_filters(&item);
+        assert!(defaults[0].enabled);
+        assert!(!defaults[1].enabled);
+
+        let body = build_search_body(
+            &item,
+            &defaults,
+            &MiscFilters {
+                sockets_min: Some(6),
+                links_min: Some(6),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            body["query"]["filters"]["socket_filters"]["filters"]["links"]["min"],
+            6
+        );
+        assert_eq!(
+            body["query"]["filters"]["socket_filters"]["filters"]["sockets"]["min"],
+            6
+        );
+    }
+
+    #[test]
+    fn as_explicit_downgrades_special_types() {
+        let mut fractured = mod_with("+# to maximum Life", "fractured.stat_3299347043", Some(80.0));
+        fractured.mod_type = ModType::Fractured;
+        fractured.explicit_ids = vec!["explicit.stat_3299347043".to_string()];
+        let item = ParsedItem {
+            base_type: "Spine Bow".to_string(),
+            rarity: Some(Rarity::Rare),
+            mods: vec![fractured],
+            ..Default::default()
+        };
+
+        let typed = build_search_body(
+            &item,
+            &[FilterSpec { enabled: true, as_explicit: false, min: Some(80.0), max: None }],
+            &MiscFilters::default(),
+        );
+        assert_eq!(
+            typed["query"]["stats"][0]["filters"][0]["id"],
+            "fractured.stat_3299347043"
+        );
+
+        let downgraded = build_search_body(
+            &item,
+            &[FilterSpec { enabled: true, as_explicit: true, min: Some(80.0), max: None }],
+            &MiscFilters::default(),
+        );
+        assert_eq!(
+            downgraded["query"]["stats"][0]["filters"][0]["id"],
+            "explicit.stat_3299347043"
+        );
     }
 
     #[test]
@@ -487,6 +595,7 @@ mod tests {
             &MiscFilters {
                 corrupted: Some(true),
                 status: Status::Any,
+                ..Default::default()
             },
         );
         assert_eq!(body["query"]["status"]["option"], "any");

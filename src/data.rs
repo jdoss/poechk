@@ -42,7 +42,17 @@ struct Stat {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct Resolve {
+    /// Parallel to `stats`: which item-category (set) each member applies to;
+    /// `null` marks the default member.
+    #[serde(default)]
+    test: Option<Vec<Option<String>>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct StatGroup {
+    #[serde(default)]
+    resolve: Option<Resolve>,
     stats: Vec<Stat>,
 }
 
@@ -65,6 +75,40 @@ pub struct StatMatch {
     pub value: Option<f64>,
     /// Whether the roll should be negated when comparing.
     pub negate: bool,
+    /// For select-group members: the item-category (set) this variant applies
+    /// to — e.g. the local form of "+# to Armour" carries `ARMOUR`. `None`
+    /// marks the default/global variant.
+    pub category_test: Option<String>,
+}
+
+/// Whether a select-group test matches an item category. Tests are either a
+/// set name (WEAPON/ARMOUR/HEIST_EQUIPMENT) or a literal category.
+pub fn category_matches(test: &str, category: &str) -> bool {
+    const WEAPON: [&str; 15] = [
+        "Bow",
+        "Claw",
+        "Dagger",
+        "Rune Dagger",
+        "One-Handed Axe",
+        "One-Handed Mace",
+        "One-Handed Sword",
+        "Sceptre",
+        "Staff",
+        "Warstaff",
+        "Two-Handed Axe",
+        "Two-Handed Mace",
+        "Two-Handed Sword",
+        "Wand",
+        "Fishing Rod",
+    ];
+    const ARMOUR: [&str; 5] = ["Body Armour", "Boots", "Gloves", "Helmet", "Shield"];
+    const HEIST: [&str; 4] = ["Heist Brooch", "Heist Cloak", "Heist Gear", "Heist Tool"];
+    match test {
+        "WEAPON" => WEAPON.contains(&category),
+        "ARMOUR" => ARMOUR.contains(&category),
+        "HEIST_EQUIPMENT" => HEIST.contains(&category),
+        literal => literal == category,
+    }
 }
 
 /// Maps templated mod text (rolls replaced by `#`) to candidate stats.
@@ -88,13 +132,18 @@ impl StatIndex {
     }
 }
 
-fn index_stat(stat: Stat, by_text: &mut HashMap<String, Vec<StatMatch>>) {
+fn index_stat(
+    stat: Stat,
+    category_test: Option<String>,
+    by_text: &mut HashMap<String, Vec<StatMatch>>,
+) {
     for matcher in &stat.matchers {
         let entry = StatMatch {
             stat_ref: stat.ref_.clone(),
             trade_ids: stat.trade.ids.clone(),
             value: matcher.value,
             negate: matcher.negate.unwrap_or(false),
+            category_test: category_test.clone(),
         };
         by_text
             .entry(matcher.string.clone())
@@ -112,10 +161,12 @@ pub fn load_stats() -> StatIndex {
     let mut skipped = 0usize;
     for line in STATS_NDJSON.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<StatEntry>(line) {
-            Ok(StatEntry::Single(stat)) => index_stat(stat, &mut by_text),
+            Ok(StatEntry::Single(stat)) => index_stat(stat, None, &mut by_text),
             Ok(StatEntry::Group(group)) => {
-                for stat in group.stats {
-                    index_stat(stat, &mut by_text);
+                let tests = group.resolve.and_then(|r| r.test).unwrap_or_default();
+                for (i, stat) in group.stats.into_iter().enumerate() {
+                    let test = tests.get(i).cloned().flatten();
+                    index_stat(stat, test, &mut by_text);
                 }
             }
             Err(_) => skipped += 1,

@@ -66,9 +66,9 @@ impl ModType {
         (None, line)
     }
 
-    /// Read the mod type from an advanced `{ … Modifier … }` info line.
-    /// Returns `None` for anything that is not such a line.
-    pub fn from_info_line(line: &str) -> Option<ModType> {
+    /// Read the mod type and affix slot from an advanced `{ … Modifier … }`
+    /// info line. Returns `None` for anything that is not such a line.
+    pub fn from_info_line(line: &str) -> Option<(ModType, Option<Slot>)> {
         let inner = line.strip_prefix('{')?;
         let ty = if inner.contains("Implicit") {
             ModType::Implicit
@@ -81,8 +81,23 @@ impl ModType {
         } else {
             ModType::Explicit
         };
-        Some(ty)
+        let slot = if inner.contains("Prefix") {
+            Some(Slot::Prefix)
+        } else if inner.contains("Suffix") {
+            Some(Slot::Suffix)
+        } else {
+            None
+        };
+        Some((ty, slot))
     }
+}
+
+/// Whether an affix occupies a prefix or suffix slot (known only from the
+/// advanced clipboard format's `{ … }` info lines).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Slot {
+    Prefix,
+    Suffix,
 }
 
 /// A parsed affix resolved to its trade stat-id.
@@ -91,6 +106,9 @@ pub struct ParsedMod {
     /// The mod line without its type marker or metadata tail.
     pub text: String,
     pub mod_type: ModType,
+    /// Prefix/suffix slot, when the advanced format's info line named it.
+    #[serde(default)]
+    pub slot: Option<Slot>,
     /// The matched template (rolls replaced by `#`).
     pub template: String,
     /// The numeric rolls, in order.
@@ -99,6 +117,10 @@ pub struct ParsedMod {
     pub stat_ref: String,
     /// Trade stat-ids for this mod type.
     pub trade_ids: Vec<String>,
+    /// Plain-explicit ids, kept so special types (fractured/crafted/…) can
+    /// optionally be searched as ordinary explicit mods.
+    #[serde(default)]
+    pub explicit_ids: Vec<String>,
 }
 
 impl ParsedMod {
@@ -176,33 +198,61 @@ fn strip_metadata(line: &str) -> &str {
 
 /// Resolve a printed mod line to a [`ParsedMod`], or `None` if unknown.
 ///
-/// `context` is the type from a preceding advanced `{ … }` info line, used when
-/// the line has no ` (type)` suffix of its own.
-pub fn parse_mod(line: &str, stats: &StatIndex, context: Option<ModType>) -> Option<ParsedMod> {
+/// `context` is the (type, slot) from a preceding advanced `{ … }` info line,
+/// used when the line has no ` (type)` suffix of its own. `category` is the
+/// item's category ("Body Armour", "Bow", …), used to pick the right variant
+/// when the same text is a local stat on some gear and global elsewhere.
+pub fn parse_mod(
+    line: &str,
+    stats: &StatIndex,
+    context: Option<(ModType, Option<Slot>)>,
+    category: Option<&str>,
+) -> Option<ParsedMod> {
     let (suffix_type, rest) = ModType::from_suffix(line.trim());
     let body = strip_metadata(rest);
-    let mod_type = suffix_type.or(context).unwrap_or(ModType::Explicit);
+    let (context_type, slot) = context.map_or((None, None), |(ty, slot)| (Some(ty), slot));
+    let mod_type = suffix_type.or(context_type).unwrap_or(ModType::Explicit);
     let key = mod_type.trade_key();
 
     // Try the raw body (flag / singular-value matchers) then templated variants.
     let raw = (body.to_string(), Vec::new());
     for (candidate, candidate_rolls) in std::iter::once(raw).chain(candidates(body)) {
-        for stat in stats.lookup(&candidate) {
-            let Some(ids) = stat.trade_ids.get(key) else {
-                continue;
-            };
+        let viable: Vec<&crate::data::StatMatch> = stats
+            .lookup(&candidate)
+            .iter()
+            .filter(|stat| stat.trade_ids.contains_key(key))
+            .collect();
+        // Prefer the variant scoped to this item's category (e.g. the local
+        // "+# to Armour" on armour pieces), then fall back to the default.
+        let chosen = viable
+            .iter()
+            .find(|stat| match (&stat.category_test, category) {
+                (Some(test), Some(category)) => crate::data::category_matches(test, category),
+                _ => false,
+            })
+            .or_else(|| viable.iter().find(|stat| stat.category_test.is_none()))
+            .copied();
+        if let Some(stat) = chosen {
+            let ids = &stat.trade_ids[key];
             let rolls = if candidate_rolls.is_empty() {
                 stat.value.map(|v| vec![v]).unwrap_or_default()
             } else {
                 candidate_rolls.clone()
             };
+            let explicit_ids = if key == "explicit" {
+                ids.clone()
+            } else {
+                stat.trade_ids.get("explicit").cloned().unwrap_or_default()
+            };
             return Some(ParsedMod {
                 text: body.to_string(),
                 mod_type,
+                slot,
                 template: candidate.clone(),
                 rolls,
                 stat_ref: stat.stat_ref.clone(),
                 trade_ids: ids.clone(),
+                explicit_ids,
             });
         }
     }
@@ -243,18 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn from_info_line_reads_advanced_type() {
+    fn from_info_line_reads_type_and_slot() {
         assert_eq!(
             ModType::from_info_line("{ Fractured Prefix Modifier \"Crystalising\" }"),
-            Some(ModType::Fractured)
+            Some((ModType::Fractured, Some(Slot::Prefix)))
         );
         assert_eq!(
             ModType::from_info_line("{ Master Crafted Prefix Modifier \"Upgraded\" }"),
-            Some(ModType::Crafted)
+            Some((ModType::Crafted, Some(Slot::Prefix)))
         );
         assert_eq!(
             ModType::from_info_line("{ Suffix Modifier \"of the Essence\" }"),
-            Some(ModType::Explicit)
+            Some((ModType::Explicit, Some(Slot::Suffix)))
         );
         assert_eq!(ModType::from_info_line("+10 to Strength"), None);
     }
@@ -263,13 +313,13 @@ mod tests {
     fn resolves_explicit_and_implicit_to_trade_ids() {
         let stats = load_stats();
 
-        let ex = parse_mod("+45 to Dexterity", &stats, None).expect("explicit resolves");
+        let ex = parse_mod("+45 to Dexterity", &stats, None, None).expect("explicit resolves");
         assert_eq!(ex.mod_type, ModType::Explicit);
         assert_eq!(ex.roll(), Some(45.0));
         assert!(ex.trade_ids.contains(&"explicit.stat_3261801346".to_string()));
 
         let im =
-            parse_mod("+45 to Dexterity (implicit)", &stats, None).expect("implicit resolves");
+            parse_mod("+45 to Dexterity (implicit)", &stats, None, None).expect("implicit resolves");
         assert_eq!(im.mod_type, ModType::Implicit);
         assert!(im.trade_ids.contains(&"implicit.stat_3261801346".to_string()));
     }
@@ -280,10 +330,12 @@ mod tests {
         let m = parse_mod(
             "Hits can't be Evaded \u{2014} Unscalable Value",
             &stats,
-            Some(ModType::Crafted),
+            Some((ModType::Crafted, Some(Slot::Prefix))),
+            None,
         )
         .expect("crafted resolves");
         assert_eq!(m.mod_type, ModType::Crafted);
+        assert_eq!(m.slot, Some(Slot::Prefix));
         assert_eq!(m.text, "Hits can't be Evaded");
         assert!(m.trade_ids.iter().any(|id| id.starts_with("crafted.")));
     }
@@ -291,6 +343,29 @@ mod tests {
     #[test]
     fn unknown_mod_returns_none() {
         let stats = load_stats();
-        assert!(parse_mod("Totally Not A Real Mod", &stats, None).is_none());
+        assert!(parse_mod("Totally Not A Real Mod", &stats, None, None).is_none());
+    }
+
+    #[test]
+    fn picks_local_variant_on_matching_category() {
+        let stats = load_stats();
+
+        // On a body armour, "+# to Armour" is the LOCAL defence stat…
+        let local = parse_mod("+326 to Armour", &stats, None, Some("Body Armour"))
+            .expect("flat armour resolves");
+        assert!(
+            local.trade_ids.contains(&"explicit.stat_3484657501".to_string()),
+            "expected local armour id, got {:?}",
+            local.trade_ids
+        );
+
+        // …while with no category (e.g. a jewel-ish context) it's the global one.
+        let global =
+            parse_mod("+326 to Armour", &stats, None, None).expect("flat armour resolves");
+        assert!(
+            global.trade_ids.contains(&"explicit.stat_809229260".to_string()),
+            "expected global armour id, got {:?}",
+            global.trade_ids
+        );
     }
 }

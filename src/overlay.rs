@@ -18,9 +18,10 @@ use cosmic::iced::platform_specific::shell::commands::layer_surface::{
 };
 use cosmic::iced::widget::{Column, Row, button, checkbox, container, pick_list, text, text_input};
 use cosmic::iced::window;
-use cosmic::iced::{self, Element, Length, Subscription, Task};
+use cosmic::iced::{self, Color, Element, Length, Subscription, Task};
 
 use crate::config::Config;
+use crate::item::mods::{ModType, Slot};
 use crate::item::{ParsedItem, Rarity};
 use crate::price::PriceQuote;
 use crate::price::trade::{
@@ -29,7 +30,7 @@ use crate::price::trade::{
 };
 
 const CARD_WIDTH: u32 = 520;
-const CARD_HEIGHT: u32 = 560;
+const CARD_HEIGHT: u32 = 620;
 const CARD_PADDING: u16 = 12;
 
 static ITEM: OnceLock<ParsedItem> = OnceLock::new();
@@ -70,6 +71,9 @@ enum SearchState {
 /// Editable filter state for one affix (min/max as text so they can be typed).
 struct FilterRow {
     enabled: bool,
+    /// Whether a special-type mod (fractured/crafted/…) must match as that
+    /// type; toggled off it searches as a plain explicit.
+    typed: bool,
     min: String,
     max: String,
 }
@@ -111,6 +115,9 @@ struct Overlay {
     config: Config,
     leagues: Vec<String>,
     rows: Vec<FilterRow>,
+    /// Minimum sockets / links filters, as editable text ("" = no filter).
+    sockets_min: String,
+    links_min: String,
     status: Status,
     corrupted: Corrupted,
     /// The trade-site URL for the last search, for "Open in browser".
@@ -121,8 +128,11 @@ struct Overlay {
 #[derive(Debug, Clone)]
 enum Message {
     SetEnabled(usize, bool),
+    ToggleModType(usize),
     SetMin(usize, String),
     SetMax(usize, String),
+    SetSocketsMin(String),
+    SetLinksMin(String),
     SetLeague(String),
     LeaguesLoaded(Vec<String>),
     CycleStatus,
@@ -143,6 +153,7 @@ impl Overlay {
             .iter()
             .map(|spec| FilterRow {
                 enabled: spec.enabled,
+                typed: true,
                 min: spec.min.map(fmt_amount).unwrap_or_default(),
                 max: String::new(),
             })
@@ -169,11 +180,26 @@ impl Overlay {
             }
         };
 
+        // Pre-fill sockets/links from the item when they matter (5+ links or
+        // 5+ sockets drive price); leave empty (= unfiltered) otherwise.
+        let sockets_min = item
+            .sockets
+            .filter(|&n| n >= 5)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let links_min = item
+            .links
+            .filter(|&n| n >= 5)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+
         let state = Overlay {
             item,
             config,
             leagues,
             rows,
+            sockets_min,
+            links_min,
             status: Status::InstantBuyout,
             corrupted: Corrupted::Any,
             trade_url: None,
@@ -187,6 +213,12 @@ impl Overlay {
             Message::SetEnabled(i, on) => {
                 if let Some(row) = self.rows.get_mut(i) {
                     row.enabled = on;
+                }
+                Task::none()
+            }
+            Message::ToggleModType(i) => {
+                if let Some(row) = self.rows.get_mut(i) {
+                    row.typed = !row.typed;
                 }
                 Task::none()
             }
@@ -234,6 +266,14 @@ impl Overlay {
                 self.search = SearchState::Failed(err);
                 Task::none()
             }
+            Message::SetSocketsMin(value) => {
+                self.sockets_min = value;
+                Task::none()
+            }
+            Message::SetLinksMin(value) => {
+                self.links_min = value;
+                Task::none()
+            }
             Message::SetLeague(league) => {
                 self.config.league = league;
                 if let Err(e) = crate::config::save(&self.config) {
@@ -261,6 +301,7 @@ impl Overlay {
             .iter()
             .map(|row| FilterSpec {
                 enabled: row.enabled,
+                as_explicit: !row.typed,
                 min: row.min.trim().parse().ok(),
                 max: row.max.trim().parse().ok(),
             })
@@ -272,6 +313,8 @@ impl Overlay {
         MiscFilters {
             status: self.status,
             corrupted: self.corrupted.option(),
+            sockets_min: self.sockets_min.trim().parse().ok(),
+            links_min: self.links_min.trim().parse().ok(),
         }
     }
 
@@ -302,27 +345,38 @@ impl Overlay {
                 ),
         );
 
-        for (index, (parsed, row)) in item.mods.iter().zip(&self.rows).enumerate() {
-            let affix = Row::new()
-                .spacing(6)
-                .align_y(Vertical::Center)
-                .push(checkbox(row.enabled).on_toggle(move |checked| Message::SetEnabled(index, checked)))
-                .push(text(parsed.text.clone()).size(13.0).width(Length::Fill))
-                .push(
-                    text_input("min", &row.min)
-                        .on_input(move |v| Message::SetMin(index, v))
-                        .size(12.0)
-                        .padding(4)
-                        .width(Length::Fixed(56.0)),
-                )
-                .push(
-                    text_input("max", &row.max)
-                        .on_input(move |v| Message::SetMax(index, v))
-                        .size(12.0)
-                        .padding(4)
-                        .width(Length::Fixed(56.0)),
-                );
-            col = col.push(affix);
+        if item.sockets.is_some() {
+            col = col.push(
+                Row::new()
+                    .spacing(6)
+                    .align_y(Vertical::Center)
+                    .push(text("Sockets ≥").size(12.0))
+                    .push(
+                        text_input("any", &self.sockets_min)
+                            .on_input(Message::SetSocketsMin)
+                            .size(12.0)
+                            .padding(4)
+                            .width(Length::Fixed(44.0)),
+                    )
+                    .push(text("Links ≥").size(12.0))
+                    .push(
+                        text_input("any", &self.links_min)
+                            .on_input(Message::SetLinksMin)
+                            .size(12.0)
+                            .padding(4)
+                            .width(Length::Fixed(44.0)),
+                    ),
+            );
+        }
+
+        for (title, indices) in affix_sections(item) {
+            if indices.is_empty() {
+                continue;
+            }
+            col = col.push(text(title).size(10.0).color(SECTION_COLOR));
+            for index in indices {
+                col = col.push(self.affix_row(index));
+            }
         }
 
         let controls = Row::new()
@@ -363,6 +417,103 @@ impl Overlay {
 
     fn subscription(&self) -> Subscription<Message> {
         input_subscription()
+    }
+
+    /// One affix as `[✓] [badge] text [min] [max]`.
+    fn affix_row(&self, index: usize) -> Element<'_, Message> {
+        let parsed = &self.item.mods[index];
+        let state = &self.rows[index];
+        let mut row = Row::new()
+            .spacing(6)
+            .align_y(Vertical::Center)
+            .push(checkbox(state.enabled).on_toggle(move |on| Message::SetEnabled(index, on)));
+        if let Some((tag, color)) = type_badge(parsed.mod_type) {
+            let typed = state.typed;
+            row = row.push(
+                button(text(tag).size(10.0))
+                    .on_press(Message::ToggleModType(index))
+                    .padding([2, 6])
+                    .style(move |_theme, _status| badge_style(color, typed)),
+            );
+        }
+        row.push(text(parsed.text.clone()).size(13.0).width(Length::Fill))
+            .push(
+                text_input("min", &state.min)
+                    .on_input(move |v| Message::SetMin(index, v))
+                    .size(12.0)
+                    .padding(4)
+                    .width(Length::Fixed(56.0)),
+            )
+            .push(
+                text_input("max", &state.max)
+                    .on_input(move |v| Message::SetMax(index, v))
+                    .size(12.0)
+                    .padding(4)
+                    .width(Length::Fixed(56.0)),
+            )
+            .into()
+    }
+}
+
+const SECTION_COLOR: Color = Color::from_rgb(0.55, 0.55, 0.55);
+
+/// Bucket mod indices into display sections. Prefix/suffix slots come from the
+/// advanced clipboard format; standard copies land in a flat "Mods" section.
+fn affix_sections(item: &ParsedItem) -> [(&'static str, Vec<usize>); 5] {
+    let mut enchants = Vec::new();
+    let mut implicits = Vec::new();
+    let mut prefixes = Vec::new();
+    let mut suffixes = Vec::new();
+    let mut other = Vec::new();
+    for (index, parsed) in item.mods.iter().enumerate() {
+        match (parsed.mod_type, parsed.slot) {
+            (ModType::Enchant, _) => enchants.push(index),
+            (ModType::Implicit, _) => implicits.push(index),
+            (_, Some(Slot::Prefix)) => prefixes.push(index),
+            (_, Some(Slot::Suffix)) => suffixes.push(index),
+            _ => other.push(index),
+        }
+    }
+    [
+        ("Enchants", enchants),
+        ("Implicits", implicits),
+        ("Prefixes", prefixes),
+        ("Suffixes", suffixes),
+        ("Mods", other),
+    ]
+}
+
+/// Badge-button style: pressed-in (filled) while the special type must match,
+/// outlined once downgraded to plain explicit.
+fn badge_style(color: Color, active: bool) -> cosmic::iced::widget::button::Style {
+    use cosmic::iced::widget::button::Style;
+    if active {
+        Style {
+            background: Some(iced::Background::Color(color)),
+            text_color: Color::from_rgb(0.09, 0.09, 0.11),
+            border_radius: 4.0.into(),
+            ..Style::default()
+        }
+    } else {
+        Style {
+            background: None,
+            text_color: SECTION_COLOR,
+            border_radius: 4.0.into(),
+            border_width: 1.0,
+            border_color: SECTION_COLOR,
+            ..Style::default()
+        }
+    }
+}
+
+/// A small colored tag for affix provenance that matters when pricing.
+fn type_badge(mod_type: ModType) -> Option<(&'static str, Color)> {
+    match mod_type {
+        ModType::Crafted => Some(("crafted", Color::from_rgb8(0x9c, 0x9c, 0xf0))),
+        ModType::Fractured => Some(("fractured", Color::from_rgb8(0xc8, 0xa0, 0x5a))),
+        ModType::Veiled => Some(("veiled", Color::from_rgb8(0xb0, 0x6a, 0xd0))),
+        ModType::Scourge => Some(("scourge", Color::from_rgb8(0xd0, 0x64, 0x50))),
+        ModType::Enchant | ModType::Implicit | ModType::Explicit => None,
     }
 }
 

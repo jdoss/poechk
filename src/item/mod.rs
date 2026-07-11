@@ -93,6 +93,8 @@ pub struct ParsedItem {
     pub category: Option<String>,
     pub item_level: Option<u32>,
     pub quality: Option<u32>,
+    /// Total number of sockets.
+    pub sockets: Option<u8>,
     /// Size of the largest linked socket group.
     pub links: Option<u8>,
     pub corrupted: bool,
