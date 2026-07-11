@@ -7,6 +7,7 @@
 //! limiter land next; this file currently builds the request and models the
 //! responses.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -29,41 +30,195 @@ const FETCH_LIMIT: usize = 10;
 /// Build the `POST /api/trade/search` body for an item: search by base type
 /// (plus name for uniques), with one stat filter per resolved affix at its
 /// current roll, sorted cheapest-first.
-pub fn build_search_body(item: &ParsedItem) -> Value {
-    // A unique is identified by its name, and its affix rolls vary widely, so
-    // filtering on them returns nothing useful — leave them disabled by default
-    // (the user enables/tightens specific ones in the interactive overlay, M4).
-    let is_unique = item.rarity == Some(Rarity::Unique);
-    let filters: Vec<Value> = item
+/// Per-affix trade filter settings (one per `item.mods` entry).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilterSpec {
+    pub enabled: bool,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// The trade "status" filter — which sellers/listings to include.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Status {
+    /// Buyable now: online seller with a buyout price (Awakened's default).
+    #[default]
+    InstantBuyout,
+    /// Any online seller.
+    Online,
+    /// Everything, including offline listings.
+    Any,
+}
+
+impl Status {
+    /// The trade API `status.option` value.
+    pub fn option(self) -> &'static str {
+        match self {
+            Status::InstantBuyout => "available",
+            Status::Online => "online",
+            Status::Any => "any",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::InstantBuyout => "Instant Buyout",
+            Status::Online => "Online",
+            Status::Any => "Any",
+        }
+    }
+    pub fn next(self) -> Status {
+        match self {
+            Status::InstantBuyout => Status::Online,
+            Status::Online => Status::Any,
+            Status::Any => Status::InstantBuyout,
+        }
+    }
+}
+
+/// Item-level trade filters that are not per-affix.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MiscFilters {
+    pub status: Status,
+    /// None = any; Some(true) = corrupted only; Some(false) = uncorrupted only.
+    pub corrupted: Option<bool>,
+}
+
+/// The outcome of a price search: the search id (for the trade URL), the total
+/// match count, and the cheapest listings.
+#[derive(Debug, Clone)]
+pub struct PriceResult {
+    pub search_id: String,
+    pub total: u32,
+    pub quotes: Vec<PriceQuote>,
+}
+
+pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscFilters) -> Value {
+    let stat_filters: Vec<Value> = item
         .mods
         .iter()
-        .filter_map(|m| stat_filter(m, is_unique))
+        .enumerate()
+        .filter_map(|(i, m)| filters.get(i).and_then(|spec| stat_filter(m, spec)))
         .collect();
 
     // "any" (not "online") for valuation: fairly-priced sellers are often
-    // offline, so online-only skews high. The online/any toggle lands in M4.
+    // offline, so online-only skews high. (Online/any toggle: later.)
     let mut query = json!({
-        "status": { "option": "any" },
+        "status": { "option": misc.status.option() },
         "type": item.base_type,
-        "stats": [ { "type": "and", "filters": filters } ],
+        "stats": [ { "type": "and", "filters": stat_filters } ],
     });
-    if is_unique
+    // Uniques are found by name; the base type alone is ambiguous.
+    if item.rarity == Some(Rarity::Unique)
         && let Some(name) = &item.name
     {
         query["name"] = json!(name);
+    }
+    if let Some(corrupted) = misc.corrupted {
+        let option = if corrupted { "true" } else { "false" };
+        query["filters"] =
+            json!({ "misc_filters": { "filters": { "corrupted": { "option": option } } } });
     }
 
     json!({ "query": query, "sort": { "price": "asc" } })
 }
 
+/// The pathofexile.com trade URL for a completed search, to open in a browser.
+pub fn search_url(league: &str, search_id: &str) -> String {
+    format!(
+        "https://www.pathofexile.com/trade/search/{}/{}",
+        league.replace(' ', "%20"),
+        search_id
+    )
+}
+
+#[derive(Deserialize)]
+struct ApiLeague {
+    id: String,
+    #[serde(default)]
+    rules: Vec<LeagueRule>,
+}
+
+#[derive(Deserialize)]
+struct LeagueRule {
+    id: String,
+}
+
+/// Fetch the trade-searchable leagues (SSF excluded, since it can't be traded),
+/// and cache the result to disk.
+pub fn fetch_leagues() -> anyhow::Result<Vec<String>> {
+    let url = "https://www.pathofexile.com/api/leagues?type=main&realm=pc";
+    let mut resp = ureq::get(url)
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| anyhow::anyhow!("leagues request failed: {e}"))?;
+    let leagues: Vec<ApiLeague> = resp
+        .body_mut()
+        .read_json()
+        .map_err(|e| anyhow::anyhow!("parsing leagues response: {e}"))?;
+    let ids: Vec<String> = leagues
+        .into_iter()
+        .filter(|league| !league.rules.iter().any(|rule| rule.id == "NoParties"))
+        .map(|league| league.id)
+        .collect();
+    save_league_cache(&ids);
+    Ok(ids)
+}
+
+/// The leagues from the on-disk cache (empty if there is none yet).
+pub fn cached_leagues() -> Vec<String> {
+    league_cache_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn league_cache_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("io.github", "jdoss", "poechk")
+        .map(|dirs| dirs.cache_dir().join("leagues.json"))
+}
+
+fn save_league_cache(ids: &[String]) {
+    let Some(path) = league_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(ids) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Default filters: a unique's affix rolls vary widely, so it is searched by
+/// name with affixes off; everything else filters on all resolved affixes at
+/// their current roll (min = roll, no max).
+pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
+    let enabled = item.rarity != Some(Rarity::Unique);
+    item.mods
+        .iter()
+        .map(|m| FilterSpec {
+            enabled,
+            min: m.roll().map(f64::floor),
+            max: None,
+        })
+        .collect()
+}
+
 /// One trade stat filter for a resolved mod, or `None` if it has no trade id.
-fn stat_filter(m: &crate::item::mods::ParsedMod, disabled: bool) -> Option<Value> {
+fn stat_filter(m: &crate::item::mods::ParsedMod, spec: &FilterSpec) -> Option<Value> {
     let id = m.trade_ids.first()?;
-    let mut filter = json!({ "id": id, "disabled": disabled });
-    if !disabled
-        && let Some(roll) = m.roll()
-    {
-        filter["value"] = json!({ "min": roll.floor() });
+    let mut filter = json!({ "id": id, "disabled": !spec.enabled });
+    if spec.enabled {
+        let mut value = serde_json::Map::new();
+        if let Some(min) = spec.min {
+            value.insert("min".to_string(), json!(min));
+        }
+        if let Some(max) = spec.max {
+            value.insert("max".to_string(), json!(max));
+        }
+        if !value.is_empty() {
+            filter["value"] = Value::Object(value);
+        }
     }
     Some(filter)
 }
@@ -155,15 +310,24 @@ impl TradeSource {
     }
 
     /// Search + fetch, returning the total match count and the cheapest listings
-    /// (cheapest-first).
-    pub fn price(&self, item: &ParsedItem) -> anyhow::Result<(u32, Vec<PriceQuote>)> {
-        let body = build_search_body(item);
+    /// (cheapest-first). `enabled[i]` turns the filter for `item.mods[i]` on.
+    pub fn price(
+        &self,
+        item: &ParsedItem,
+        filters: &[FilterSpec],
+        misc: &MiscFilters,
+    ) -> anyhow::Result<PriceResult> {
+        let body = build_search_body(item, filters, misc);
         let limiter = RateLimiter::open()?;
 
         limiter.wait("search");
         let search = self.search(&body, &limiter)?;
         if search.result.is_empty() {
-            return Ok((search.total, Vec::new()));
+            return Ok(PriceResult {
+                search_id: search.id,
+                total: search.total,
+                quotes: Vec::new(),
+            });
         }
         let ids: Vec<String> = search.result.iter().take(FETCH_LIMIT).cloned().collect();
 
@@ -181,7 +345,11 @@ impl TradeSource {
                 })
             })
             .collect();
-        Ok((search.total, quotes))
+        Ok(PriceResult {
+            search_id: search.id,
+            total: search.total,
+            quotes,
+        })
     }
 
     fn search(&self, body: &Value, limiter: &RateLimiter) -> anyhow::Result<SearchResponse> {
@@ -268,10 +436,10 @@ mod tests {
             ..Default::default()
         };
 
-        let body = build_search_body(&item);
+        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
 
         assert_eq!(body["query"]["type"], "Jewelled Foil");
-        assert_eq!(body["query"]["status"]["option"], "any");
+        assert_eq!(body["query"]["status"]["option"], "available");
         assert_eq!(body["sort"]["price"], "asc");
         assert!(body["query"].get("name").is_none());
 
@@ -298,12 +466,43 @@ mod tests {
             )],
             ..Default::default()
         };
-        let body = build_search_body(&item);
+        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
         assert_eq!(body["query"]["name"], "Whispers of Infinity");
         assert_eq!(body["query"]["type"], "Seaglass Amulet");
         // Present but disabled, so the search returns every listing of the unique.
         let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
         assert_eq!(filters[0]["disabled"], true);
         assert!(filters[0].get("value").is_none());
+    }
+
+    #[test]
+    fn status_corrupted_filters_and_trade_url() {
+        let item = ParsedItem {
+            base_type: "Seaglass Amulet".to_string(),
+            ..Default::default()
+        };
+        let body = build_search_body(
+            &item,
+            &[],
+            &MiscFilters {
+                corrupted: Some(true),
+                status: Status::Any,
+            },
+        );
+        assert_eq!(body["query"]["status"]["option"], "any");
+        assert_eq!(
+            body["query"]["filters"]["misc_filters"]["filters"]["corrupted"]["option"],
+            "true"
+        );
+
+        // Default is Instant Buyout (status "available"), no corrupted filter.
+        let plain = build_search_body(&item, &[], &MiscFilters::default());
+        assert_eq!(plain["query"]["status"]["option"], "available");
+        assert!(plain["query"].get("filters").is_none());
+
+        assert_eq!(
+            search_url("Standard", "abc123"),
+            "https://www.pathofexile.com/trade/search/Standard/abc123"
+        );
     }
 }

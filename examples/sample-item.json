@@ -1,39 +1,28 @@
 {
-  "item": {
-    "game": "poe1",
-    "item_class": "Bows",
-    "rarity": "Rare",
-    "name": "Death Whisper",
-    "base_type": "Spine Bow",
-    "item_level": 32,
-    "links": 3,
-    "corrupted": true,
-    "mods": [
-      {
-        "text": "+45 to Dexterity",
-        "mod_type": "Explicit",
-        "template": "# to Dexterity",
-        "rolls": [45.0],
-        "stat_ref": "+# to Dexterity",
-        "trade_ids": ["explicit.stat_3261801346"]
-      },
-      {
-        "text": "+80 to maximum Life",
-        "mod_type": "Explicit",
-        "template": "# to maximum Life",
-        "rolls": [80.0],
-        "stat_ref": "+# to maximum Life",
-        "trade_ids": ["explicit.stat_3299347043"]
-      }
-    ],
-    "raw_text": "Item Class: Bows\nRarity: Rare\nDeath Whisper\nSpine Bow\n--------\nItem Level: 32\n--------\n+45 to Dexterity\n+80 to maximum Life\n--------\nCorrupted\n"
-  },
-  "quotes": [
-    { "amount": 1.0, "currency": "chaos", "source": "trade" },
-    { "amount": 1.0, "currency": "chaos", "source": "trade" },
-    { "amount": 1.0, "currency": "chaos", "source": "trade" },
-    { "amount": 3.0, "currency": "chaos", "source": "trade" },
-    { "amount": 5.0, "currency": "chaos", "source": "trade" }
+  "game": "poe1",
+  "item_class": "Amulets",
+  "rarity": "Unique",
+  "name": "Whispers of Infinity",
+  "base_type": "Seaglass Amulet",
+  "item_level": 87,
+  "corrupted": true,
+  "mods": [
+    {
+      "text": "+81 to maximum Energy Shield",
+      "mod_type": "Explicit",
+      "template": "# to maximum Energy Shield",
+      "rolls": [81.0],
+      "stat_ref": "+# to maximum Energy Shield",
+      "trade_ids": ["explicit.stat_3489782002"]
+    },
+    {
+      "text": "60% reduced maximum Mana",
+      "mod_type": "Explicit",
+      "template": "#% reduced maximum Mana",
+      "rolls": [60.0],
+      "stat_ref": "#% reduced maximum Mana",
+      "trade_ids": ["explicit.stat_1187803783"]
+    }
   ],
-  "total": 8123
+  "raw_text": "Item Class: Amulets\nRarity: Unique\nWhispers of Infinity\nSeaglass Amulet\n"
 }

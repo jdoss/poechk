@@ -1,38 +1,46 @@
-//! The layer-shell overlay surface (libcosmic's iced fork).
+//! The interactive layer-shell overlay.
 //!
-//! [`show`] runs an `Overlay`-layer surface that renders the price-check card
-//! and exits on Escape/Enter or when it loses focus. [`run_from_file`] is the
-//! same, reading the result from a JSON file — used for testing and, later, for
-//! when the daemon spawns the overlay as a child process.
+//! Shows the parsed item with, per affix, a checkbox and editable min/max, plus
+//! a Search button. Editing filters only updates state; pressing Search (or the
+//! initial open) runs the trade query. The blocking request runs on a worker
+//! thread and returns via a oneshot channel awaited by iced, so the UI stays
+//! responsive.
 
 use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::Context;
+use cosmic::iced::alignment::Vertical;
 use cosmic::iced::core::layout::Limits;
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     self, KeyboardInteractivity, Layer, get_layer_surface,
 };
-use cosmic::iced::widget::{Column, container, text};
+use cosmic::iced::widget::{Column, Row, button, checkbox, container, pick_list, text, text_input};
 use cosmic::iced::window;
 use cosmic::iced::{self, Element, Length, Subscription, Task};
 
+use crate::config::Config;
 use crate::item::{ParsedItem, Rarity};
 use crate::price::PriceQuote;
-use crate::result::PriceCheckResult;
+use crate::price::trade::{
+    self, FilterSpec, MiscFilters, PriceResult, Status, TradeSource, cached_leagues, fetch_leagues,
+    search_url,
+};
 
-const CARD_WIDTH: u32 = 420;
-const CARD_HEIGHT: u32 = 460;
+const CARD_WIDTH: u32 = 520;
+const CARD_HEIGHT: u32 = 560;
 const CARD_PADDING: u16 = 12;
 
-/// The result to render, set once by [`show`] before the iced runtime starts.
-static RESULT: OnceLock<PriceCheckResult> = OnceLock::new();
+static ITEM: OnceLock<ParsedItem> = OnceLock::new();
+static CONFIG: OnceLock<Config> = OnceLock::new();
 
-/// Show the overlay for a price-check result. Blocks until it is dismissed.
-pub fn show(result: PriceCheckResult) -> anyhow::Result<()> {
-    RESULT
-        .set(result)
+/// Show the interactive overlay for a parsed item. Blocks until dismissed.
+pub fn show(item: ParsedItem, config: Config) -> anyhow::Result<()> {
+    ITEM.set(item)
+        .map_err(|_| anyhow::anyhow!("overlay already initialized in this process"))?;
+    CONFIG
+        .set(config)
         .map_err(|_| anyhow::anyhow!("overlay already initialized in this process"))?;
     iced::daemon(Overlay::new, Overlay::update, Overlay::view)
         .subscription(Overlay::subscription)
@@ -41,32 +49,106 @@ pub fn show(result: PriceCheckResult) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("overlay failed: {e}"))
 }
 
-/// Show the overlay for a result previously written to `path` as JSON.
+/// Load a parsed item from a JSON file and show the overlay (for testing).
 pub fn run_from_file(path: &Path) -> anyhow::Result<()> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let result: PriceCheckResult =
+    let item: ParsedItem =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    show(result)
+    show(item, crate::config::load()?)
+}
+
+type SearchOutcome = Result<PriceResult, String>;
+
+enum SearchState {
+    Idle,
+    Searching,
+    Done(u32, Vec<PriceQuote>),
+    Failed(String),
+}
+
+/// Editable filter state for one affix (min/max as text so they can be typed).
+struct FilterRow {
+    enabled: bool,
+    min: String,
+    max: String,
+}
+
+/// Corrupted meta-filter cycle: any / corrupted only / uncorrupted only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Corrupted {
+    Any,
+    Yes,
+    No,
+}
+
+impl Corrupted {
+    fn next(self) -> Corrupted {
+        match self {
+            Corrupted::Any => Corrupted::Yes,
+            Corrupted::Yes => Corrupted::No,
+            Corrupted::No => Corrupted::Any,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Corrupted::Any => "Any",
+            Corrupted::Yes => "Yes",
+            Corrupted::No => "No",
+        }
+    }
+    fn option(self) -> Option<bool> {
+        match self {
+            Corrupted::Any => None,
+            Corrupted::Yes => Some(true),
+            Corrupted::No => Some(false),
+        }
+    }
 }
 
 struct Overlay {
-    result: PriceCheckResult,
+    item: ParsedItem,
+    config: Config,
+    leagues: Vec<String>,
+    rows: Vec<FilterRow>,
+    status: Status,
+    corrupted: Corrupted,
+    /// The trade-site URL for the last search, for "Open in browser".
+    trade_url: Option<String>,
+    search: SearchState,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
+    SetEnabled(usize, bool),
+    SetMin(usize, String),
+    SetMax(usize, String),
+    SetLeague(String),
+    LeaguesLoaded(Vec<String>),
+    CycleStatus,
+    CycleCorrupted,
+    Search,
+    OpenBrowser,
+    Searched(SearchOutcome),
     Dismiss,
 }
 
 impl Overlay {
     fn new() -> (Self, Task<Message>) {
-        let result = RESULT
-            .get()
-            .cloned()
-            .expect("overlay result must be set before show()");
+        let item = ITEM.get().cloned().expect("overlay item set before show()");
+        let config = CONFIG.get().cloned().expect("overlay config set before show()");
 
-        let init = get_layer_surface(SctkLayerSurfaceSettings {
+        let defaults = trade::default_filters(&item);
+        let rows = defaults
+            .iter()
+            .map(|spec| FilterRow {
+                enabled: spec.enabled,
+                min: spec.min.map(fmt_amount).unwrap_or_default(),
+                max: String::new(),
+            })
+            .collect();
+
+        let surface = get_layer_surface(SctkLayerSurfaceSettings {
             id: window::Id::unique(),
             layer: Layer::Overlay,
             keyboard_interactivity: KeyboardInteractivity::Exclusive,
@@ -76,18 +158,125 @@ impl Overlay {
             size_limits: Limits::NONE.min_width(1.0).min_height(1.0),
             ..Default::default()
         });
+        // No search on open — the user reviews/adjusts filters, then presses
+        // Search. (`defaults` above seeded the editable rows.)
+        let leagues = {
+            let cached = cached_leagues();
+            if cached.is_empty() {
+                vec![config.league.clone()]
+            } else {
+                cached
+            }
+        };
 
-        (Self { result }, init)
+        let state = Overlay {
+            item,
+            config,
+            leagues,
+            rows,
+            status: Status::InstantBuyout,
+            corrupted: Corrupted::Any,
+            trade_url: None,
+            search: SearchState::Idle,
+        };
+        (state, Task::batch([surface, leagues_task()]))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Dismiss => iced::exit(),
+            Message::SetEnabled(i, on) => {
+                if let Some(row) = self.rows.get_mut(i) {
+                    row.enabled = on;
+                }
+                Task::none()
+            }
+            Message::SetMin(i, value) => {
+                if let Some(row) = self.rows.get_mut(i) {
+                    row.min = value;
+                }
+                Task::none()
+            }
+            Message::SetMax(i, value) => {
+                if let Some(row) = self.rows.get_mut(i) {
+                    row.max = value;
+                }
+                Task::none()
+            }
+            Message::CycleCorrupted => {
+                self.corrupted = self.corrupted.next();
+                Task::none()
+            }
+            Message::CycleStatus => {
+                self.status = self.status.next();
+                Task::none()
+            }
+            Message::Search => {
+                self.search = SearchState::Searching;
+                search_task(
+                    self.item.clone(),
+                    self.config.clone(),
+                    self.specs(),
+                    self.misc(),
+                )
+            }
+            Message::OpenBrowser => {
+                if let Some(url) = &self.trade_url {
+                    open_url(url);
+                }
+                Task::none()
+            }
+            Message::Searched(Ok(result)) => {
+                self.trade_url = Some(search_url(&self.config.league, &result.search_id));
+                self.search = SearchState::Done(result.total, result.quotes);
+                Task::none()
+            }
+            Message::Searched(Err(err)) => {
+                self.search = SearchState::Failed(err);
+                Task::none()
+            }
+            Message::SetLeague(league) => {
+                self.config.league = league;
+                if let Err(e) = crate::config::save(&self.config) {
+                    tracing::warn!("could not save league to config: {e}");
+                }
+                Task::none()
+            }
+            Message::LeaguesLoaded(list) => {
+                if !list.is_empty() {
+                    self.leagues = list;
+                }
+                Task::none()
+            }
+            // Hard-exit rather than iced::exit(): the layer-shell + wayland
+            // teardown races with pending async tasks and can segfault. The
+            // compositor reclaims the surface when the client disconnects, so
+            // no graceful cleanup is needed here.
+            Message::Dismiss => std::process::exit(0),
+        }
+    }
+
+    /// Convert the editable rows into trade filter specs.
+    fn specs(&self) -> Vec<FilterSpec> {
+        self.rows
+            .iter()
+            .map(|row| FilterSpec {
+                enabled: row.enabled,
+                min: row.min.trim().parse().ok(),
+                max: row.max.trim().parse().ok(),
+            })
+            .collect()
+    }
+
+    /// The item-level (non-affix) filters from the current controls.
+    fn misc(&self) -> MiscFilters {
+        MiscFilters {
+            status: self.status,
+            corrupted: self.corrupted.option(),
         }
     }
 
     fn view(&self, _id: window::Id) -> Element<'_, Message> {
-        let item = &self.result.item;
+        let item = &self.item;
         let title = item.name.clone().unwrap_or_else(|| item.base_type.clone());
 
         let mut col = Column::new().spacing(4).padding(CARD_PADDING);
@@ -97,26 +286,73 @@ impl Overlay {
         }
         col = col.push(text(meta_line(item)).size(12.0));
 
-        for parsed in &item.mods {
-            col = col.push(text(format!("• {}", parsed.text)).size(13.0));
-        }
-        if !item.unknown_mods.is_empty() {
-            col = col.push(
-                text(format!("({} unrecognized line(s))", item.unknown_mods.len())).size(11.0),
-            );
+        col = col.push(
+            Row::new()
+                .spacing(6)
+                .align_y(Vertical::Center)
+                .push(text("League:").size(12.0))
+                .push(
+                    pick_list(
+                        self.leagues.clone(),
+                        Some(self.config.league.clone()),
+                        Message::SetLeague,
+                    )
+                    .text_size(13.0)
+                    .padding(4),
+                ),
+        );
+
+        for (index, (parsed, row)) in item.mods.iter().zip(&self.rows).enumerate() {
+            let affix = Row::new()
+                .spacing(6)
+                .align_y(Vertical::Center)
+                .push(checkbox(row.enabled).on_toggle(move |checked| Message::SetEnabled(index, checked)))
+                .push(text(parsed.text.clone()).size(13.0).width(Length::Fill))
+                .push(
+                    text_input("min", &row.min)
+                        .on_input(move |v| Message::SetMin(index, v))
+                        .size(12.0)
+                        .padding(4)
+                        .width(Length::Fixed(56.0)),
+                )
+                .push(
+                    text_input("max", &row.max)
+                        .on_input(move |v| Message::SetMax(index, v))
+                        .size(12.0)
+                        .padding(4)
+                        .width(Length::Fixed(56.0)),
+                );
+            col = col.push(affix);
         }
 
-        if self.result.quotes.is_empty() {
-            col = col.push(text("No listings found").size(12.0));
-        } else {
-            for (label, count) in price_bands(&self.result.quotes) {
-                col = col.push(text(format!("{label}  ×{count}")).size(15.0));
-            }
-            if self.result.total > 0 {
-                col = col.push(text(format!("{} listed", self.result.total)).size(12.0));
-            }
+        let controls = Row::new()
+            .spacing(8)
+            .push(
+                button(text("Search").size(14.0))
+                    .on_press(Message::Search)
+                    .padding([6, 16]),
+            )
+            .push(
+                button(text(self.status.label()).size(13.0))
+                    .on_press(Message::CycleStatus)
+                    .padding([6, 10]),
+            )
+            .push(
+                button(text(format!("Corrupted: {}", self.corrupted.label())).size(13.0))
+                    .on_press(Message::CycleCorrupted)
+                    .padding([6, 10]),
+            );
+        col = col.push(controls);
+        col = col.push(text("────────").size(10.0));
+        col = col.push(results_view(&self.search));
+        if self.trade_url.is_some() {
+            col = col.push(
+                button(text("Open in browser ↗").size(13.0))
+                    .on_press(Message::OpenBrowser)
+                    .padding([6, 10]),
+            );
         }
-        col = col.push(text("Esc to close").size(11.0));
+        col = col.push(text("Esc to close").size(10.0));
 
         container(col)
             .padding(CARD_PADDING)
@@ -130,7 +366,65 @@ impl Overlay {
     }
 }
 
-/// A one-line summary: rarity, class, item level, links, corrupted.
+/// Run the trade search on a worker thread; deliver the result to iced.
+fn search_task(
+    item: ParsedItem,
+    config: Config,
+    filters: Vec<FilterSpec>,
+    misc: MiscFilters,
+) -> Task<Message> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let outcome = TradeSource::new(&config)
+            .price(&item, &filters, &misc)
+            .map_err(|e| e.to_string());
+        let _ = tx.send(outcome);
+    });
+    Task::perform(
+        async move { rx.await.unwrap_or_else(|_| Err("search cancelled".to_string())) },
+        Message::Searched,
+    )
+}
+
+/// Open a URL in the default browser.
+fn open_url(url: &str) {
+    if let Err(e) = std::process::Command::new("xdg-open").arg(url).spawn() {
+        tracing::warn!("could not open browser ({e})");
+    }
+}
+
+/// Refresh the league list from the API on a worker thread.
+fn leagues_task() -> Task<Message> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(fetch_leagues().unwrap_or_default());
+    });
+    Task::perform(
+        async move { rx.await.unwrap_or_default() },
+        Message::LeaguesLoaded,
+    )
+}
+
+fn results_view(search: &SearchState) -> Element<'_, Message> {
+    match search {
+        SearchState::Idle => text("Press Search to price").size(13.0).into(),
+        SearchState::Searching => text("Searching…").size(13.0).into(),
+        SearchState::Failed(err) => text(format!("Search failed: {err}")).size(12.0).into(),
+        SearchState::Done(total, quotes) if quotes.is_empty() => {
+            text(format!("No listings ({total} matched)")).size(13.0).into()
+        }
+        SearchState::Done(total, quotes) => {
+            let mut col = Column::new().spacing(2);
+            for (label, count) in price_bands(quotes) {
+                col = col.push(text(format!("{label}  ×{count}")).size(16.0));
+            }
+            col = col.push(text(format!("{total} listed")).size(12.0));
+            col.into()
+        }
+    }
+}
+
+/// A one-line summary: rarity, class, item level, links, corrupted, fractured.
 fn meta_line(item: &ParsedItem) -> String {
     let mut parts = vec![item.rarity.map_or("Unknown", rarity_label).to_string()];
     if !item.item_class.is_empty() {
@@ -193,11 +487,8 @@ fn rarity_label(rarity: Rarity) -> &'static str {
 fn input_subscription() -> Subscription<Message> {
     cosmic::iced::event::listen_with(|event, _status, _id| match &event {
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
-            if let iced::keyboard::Key::Named(named) = key {
-                use iced::keyboard::key::Named;
-                if matches!(named, Named::Escape | Named::Enter) {
-                    return Some(Message::Dismiss);
-                }
+            if let iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) = key {
+                return Some(Message::Dismiss);
             }
             None
         }
