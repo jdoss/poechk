@@ -19,7 +19,11 @@ enum Command {
         result: std::path::PathBuf,
     },
     /// Price-check the current clipboard item. Bind this to a COSMIC shortcut.
-    Check,
+    Check {
+        /// First copy the hovered item by injecting Ctrl+Alt+C into the game.
+        #[arg(long)]
+        copy: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -33,6 +37,6 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Daemon => poechk::daemon::run(),
         Command::Overlay { result } => poechk::overlay::run_from_file(&result),
-        Command::Check => poechk::check::run(),
+        Command::Check { copy } => poechk::check::run(copy),
     }
 }

@@ -3800,6 +3800,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "x11rb",
 ]
 
 [[package]]

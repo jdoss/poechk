@@ -7,6 +7,7 @@ pub mod check;
 pub mod config;
 pub mod data;
 pub mod daemon;
+pub mod inject;
 pub mod item;
 pub mod overlay;
 pub mod price;
