@@ -110,10 +110,12 @@ pub fn parse_item(
 
     for section in sections.iter().skip(1) {
         // The weapon/armour base-stats block holds Quality alongside the
-        // item-type header and numeric properties; take Quality, skip the rest.
+        // item-type header and numeric properties; take Quality and the
+        // weapon damage/speed properties, skip the rest.
         if is_base_stats_section(section) {
             for line in section {
-                parse_meta_value(line.trim(), &mut item);
+                let line = line.trim();
+                let _ = parse_meta_value(line, &mut item) || parse_weapon_property(line, &mut item);
             }
             continue;
         }
@@ -215,6 +217,41 @@ fn socket_count(sockets: &str) -> u8 {
         .split_whitespace()
         .map(|group| group.split('-').count() as u8)
         .sum()
+}
+
+/// Handle weapon damage/speed property lines from the base-stats block.
+fn parse_weapon_property(line: &str, item: &mut ParsedItem) -> bool {
+    if let Some(rest) = line.strip_prefix("Physical Damage: ") {
+        item.phys_damage = averaged_ranges(rest);
+        return true;
+    }
+    if let Some(rest) = line.strip_prefix("Elemental Damage: ") {
+        item.ele_damage = averaged_ranges(rest);
+        return true;
+    }
+    if let Some(rest) = line.strip_prefix("Chaos Damage: ") {
+        item.chaos_damage = averaged_ranges(rest);
+        return true;
+    }
+    if let Some(rest) = line.strip_prefix("Attacks per Second: ") {
+        item.aps = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        return true;
+    }
+    false
+}
+
+/// Sum the midpoints of comma-separated damage ranges: "96-170, 10-20" -> 148.
+fn averaged_ranges(value: &str) -> Option<f64> {
+    let mut total = 0.0;
+    let mut found = false;
+    for range in value.split(',') {
+        let range = range.trim().split_whitespace().next()?;
+        let (lo, hi) = range.split_once('-')?;
+        let (lo, hi): (f64, f64) = (lo.trim().parse().ok()?, hi.trim().parse().ok()?);
+        total += (lo + hi) / 2.0;
+        found = true;
+    }
+    found.then_some(total)
 }
 
 /// Resolve the item's trade category from its base type, when known.
@@ -384,6 +421,15 @@ Fractured Item
             ModType::Explicit,
             "Attacks with this Weapon Penetrate #% Elemental Resistances"
         ));
+
+        // Weapon DPS from the base-stats block:
+        // phys (32+60)/2 = 46, ele (96+170)/2 = 133, APS 2.13.
+        assert_eq!(item.phys_damage, Some(46.0));
+        assert_eq!(item.ele_damage, Some(133.0));
+        assert_eq!(item.aps, Some(2.13));
+        assert!((item.pdps().unwrap() - 97.98).abs() < 0.01);
+        assert!((item.edps().unwrap() - 283.29).abs() < 0.01);
+        assert!((item.total_dps().unwrap() - 381.27).abs() < 0.01);
 
         // Prefix/suffix slots come from the info lines.
         assert!(item.mods.iter().any(|m| {

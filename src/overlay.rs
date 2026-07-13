@@ -29,9 +29,12 @@ use crate::price::trade::{
     search_url,
 };
 
-const CARD_WIDTH: u32 = 520;
-const CARD_HEIGHT: u32 = 620;
+const CARD_WIDTH: u32 = 540;
+const CARD_MAX_HEIGHT: u32 = 1100;
 const CARD_PADDING: u16 = 12;
+
+/// Characters of mod text that fit one row at the card width.
+const ROW_WRAP_CHARS: usize = 52;
 
 static ITEM: OnceLock<ParsedItem> = OnceLock::new();
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -74,6 +77,8 @@ struct FilterRow {
     /// Whether a special-type mod (fractured/crafted/…) must match as that
     /// type; toggled off it searches as a plain explicit.
     typed: bool,
+    /// Whether to search the mod's per-stat pseudo total (item-wide sum).
+    pseudo: bool,
     min: String,
     max: String,
 }
@@ -118,6 +123,10 @@ struct Overlay {
     /// Minimum sockets / links filters, as editable text ("" = no filter).
     sockets_min: String,
     links_min: String,
+    /// Minimum DPS filters (weapons), as editable text ("" = no filter).
+    dps_min: String,
+    pdps_min: String,
+    edps_min: String,
     status: Status,
     corrupted: Corrupted,
     /// The trade-site URL for the last search, for "Open in browser".
@@ -129,10 +138,14 @@ struct Overlay {
 enum Message {
     SetEnabled(usize, bool),
     ToggleModType(usize),
+    TogglePseudo(usize),
     SetMin(usize, String),
     SetMax(usize, String),
     SetSocketsMin(String),
     SetLinksMin(String),
+    SetDpsMin(String),
+    SetPdpsMin(String),
+    SetEdpsMin(String),
     SetLeague(String),
     LeaguesLoaded(Vec<String>),
     CycleStatus,
@@ -145,27 +158,38 @@ enum Message {
 
 impl Overlay {
     fn new() -> (Self, Task<Message>) {
-        let item = ITEM.get().cloned().expect("overlay item set before show()");
+        let mut item = ITEM.get().cloned().expect("overlay item set before show()");
         let config = CONFIG.get().cloned().expect("overlay config set before show()");
 
-        let defaults = trade::default_filters(&item);
+        // Fold total-res / total-life pseudo rows; their contributors start
+        // disabled (the pseudo represents them, and matches spread rolls).
+        let subsumed = crate::item::pseudo::fold_pseudo(&mut item);
+        let mut defaults = trade::default_filters(&item);
+        for &index in &subsumed {
+            if let Some(spec) = defaults.get_mut(index) {
+                spec.enabled = false;
+            }
+        }
         let rows = defaults
             .iter()
             .map(|spec| FilterRow {
                 enabled: spec.enabled,
                 typed: true,
+                pseudo: spec.use_pseudo,
                 min: spec.min.map(fmt_amount).unwrap_or_default(),
                 max: String::new(),
             })
             .collect();
 
+        // Explicit size: content autosize (`size: None`) fails to map on
+        // cosmic-comp, so estimate the height from the card's actual content.
         let surface = get_layer_surface(SctkLayerSurfaceSettings {
             id: window::Id::unique(),
             layer: Layer::Overlay,
             keyboard_interactivity: KeyboardInteractivity::Exclusive,
             anchor: layer_surface::Anchor::empty(),
             namespace: "poechk".into(),
-            size: Some((Some(CARD_WIDTH), Some(CARD_HEIGHT))),
+            size: Some((Some(CARD_WIDTH), Some(estimated_height(&item)))),
             size_limits: Limits::NONE.min_width(1.0).min_height(1.0),
             ..Default::default()
         });
@@ -193,6 +217,17 @@ impl Overlay {
             .map(|n| n.to_string())
             .unwrap_or_default();
 
+        // Prefill the dominant DPS kind (floored) — pDPS for physical
+        // weapons, eDPS for elemental — leaving the others unfiltered.
+        let phys_dominant = item.phys_damage.unwrap_or(0.0) >= item.ele_damage.unwrap_or(0.0);
+        let (mut pdps_min, mut edps_min) = (String::new(), String::new());
+        match (item.pdps(), item.edps()) {
+            (Some(pdps), _) if phys_dominant => pdps_min = fmt_amount(pdps.floor()),
+            (_, Some(edps)) => edps_min = fmt_amount(edps.floor()),
+            (Some(pdps), None) => pdps_min = fmt_amount(pdps.floor()),
+            _ => {}
+        }
+
         let state = Overlay {
             item,
             config,
@@ -200,6 +235,9 @@ impl Overlay {
             rows,
             sockets_min,
             links_min,
+            dps_min: String::new(),
+            pdps_min,
+            edps_min,
             status: Status::InstantBuyout,
             corrupted: Corrupted::Any,
             trade_url: None,
@@ -219,6 +257,12 @@ impl Overlay {
             Message::ToggleModType(i) => {
                 if let Some(row) = self.rows.get_mut(i) {
                     row.typed = !row.typed;
+                }
+                Task::none()
+            }
+            Message::TogglePseudo(i) => {
+                if let Some(row) = self.rows.get_mut(i) {
+                    row.pseudo = !row.pseudo;
                 }
                 Task::none()
             }
@@ -274,6 +318,18 @@ impl Overlay {
                 self.links_min = value;
                 Task::none()
             }
+            Message::SetDpsMin(value) => {
+                self.dps_min = value;
+                Task::none()
+            }
+            Message::SetPdpsMin(value) => {
+                self.pdps_min = value;
+                Task::none()
+            }
+            Message::SetEdpsMin(value) => {
+                self.edps_min = value;
+                Task::none()
+            }
             Message::SetLeague(league) => {
                 self.config.league = league;
                 if let Err(e) = crate::config::save(&self.config) {
@@ -302,6 +358,7 @@ impl Overlay {
             .map(|row| FilterSpec {
                 enabled: row.enabled,
                 as_explicit: !row.typed,
+                use_pseudo: row.pseudo,
                 min: row.min.trim().parse().ok(),
                 max: row.max.trim().parse().ok(),
             })
@@ -315,6 +372,9 @@ impl Overlay {
             corrupted: self.corrupted.option(),
             sockets_min: self.sockets_min.trim().parse().ok(),
             links_min: self.links_min.trim().parse().ok(),
+            dps_min: self.dps_min.trim().parse().ok(),
+            pdps_min: self.pdps_min.trim().parse().ok(),
+            edps_min: self.edps_min.trim().parse().ok(),
         }
     }
 
@@ -344,6 +404,49 @@ impl Overlay {
                     .padding(4),
                 ),
         );
+
+        if let Some(dps) = item.total_dps() {
+            let mut parts = vec![format!("DPS {}", fmt_amount(dps))];
+            if let Some(pdps) = item.pdps() {
+                parts.push(format!("pDPS {}", fmt_amount(pdps)));
+            }
+            if let Some(edps) = item.edps() {
+                parts.push(format!("eDPS {}", fmt_amount(edps)));
+            }
+            if let Some(aps) = item.aps {
+                parts.push(format!("{aps} APS"));
+            }
+            col = col.push(text(parts.join(" · ")).size(12.0).color(PSEUDO_COLOR));
+            col = col.push(
+                Row::new()
+                    .spacing(6)
+                    .align_y(Vertical::Center)
+                    .push(text("pDPS ≥").size(12.0))
+                    .push(
+                        text_input("any", &self.pdps_min)
+                            .on_input(Message::SetPdpsMin)
+                            .size(12.0)
+                            .padding(4)
+                            .width(Length::Fixed(56.0)),
+                    )
+                    .push(text("eDPS ≥").size(12.0))
+                    .push(
+                        text_input("any", &self.edps_min)
+                            .on_input(Message::SetEdpsMin)
+                            .size(12.0)
+                            .padding(4)
+                            .width(Length::Fixed(56.0)),
+                    )
+                    .push(text("DPS ≥").size(12.0))
+                    .push(
+                        text_input("any", &self.dps_min)
+                            .on_input(Message::SetDpsMin)
+                            .size(12.0)
+                            .padding(4)
+                            .width(Length::Fixed(56.0)),
+                    ),
+            );
+        }
 
         if item.sockets.is_some() {
             col = col.push(
@@ -436,6 +539,15 @@ impl Overlay {
                     .style(move |_theme, _status| badge_style(color, typed)),
             );
         }
+        if !parsed.pseudo_ids.is_empty() {
+            let pseudo_on = state.pseudo;
+            row = row.push(
+                button(text("pseudo").size(10.0))
+                    .on_press(Message::TogglePseudo(index))
+                    .padding([2, 6])
+                    .style(move |_theme, _status| badge_style(PSEUDO_COLOR, pseudo_on)),
+            );
+        }
         row.push(text(parsed.text.clone()).size(13.0).width(Length::Fill))
             .push(
                 text_input("min", &state.min)
@@ -456,10 +568,36 @@ impl Overlay {
 }
 
 const SECTION_COLOR: Color = Color::from_rgb(0.55, 0.55, 0.55);
+const PSEUDO_COLOR: Color = Color::from_rgb(0.42, 0.76, 0.65);
+
+/// Estimate the surface height from the card's content so tall items get room
+/// and small items stay compact.
+fn estimated_height(item: &ParsedItem) -> u32 {
+    // Title, base line, meta line, league row, padding.
+    let mut height: u32 = 165;
+    if item.total_dps().is_some() {
+        height += 58; // DPS readout + filter row
+    }
+    if item.sockets.is_some() {
+        height += 32; // sockets/links row
+    }
+    for (_, indices) in affix_sections(item) {
+        if !indices.is_empty() {
+            height += 17; // section header
+        }
+    }
+    for parsed in &item.mods {
+        height += if parsed.text.len() > ROW_WRAP_CHARS { 46 } else { 28 };
+    }
+    height += 44; // Search / status / corrupted controls
+    height += 130; // divider, results area, browser button, footer
+    height.clamp(280, CARD_MAX_HEIGHT)
+}
 
 /// Bucket mod indices into display sections. Prefix/suffix slots come from the
 /// advanced clipboard format; standard copies land in a flat "Mods" section.
-fn affix_sections(item: &ParsedItem) -> [(&'static str, Vec<usize>); 5] {
+fn affix_sections(item: &ParsedItem) -> [(&'static str, Vec<usize>); 6] {
+    let mut pseudo = Vec::new();
     let mut enchants = Vec::new();
     let mut implicits = Vec::new();
     let mut prefixes = Vec::new();
@@ -467,6 +605,7 @@ fn affix_sections(item: &ParsedItem) -> [(&'static str, Vec<usize>); 5] {
     let mut other = Vec::new();
     for (index, parsed) in item.mods.iter().enumerate() {
         match (parsed.mod_type, parsed.slot) {
+            (ModType::Pseudo, _) => pseudo.push(index),
             (ModType::Enchant, _) => enchants.push(index),
             (ModType::Implicit, _) => implicits.push(index),
             (_, Some(Slot::Prefix)) => prefixes.push(index),
@@ -475,6 +614,7 @@ fn affix_sections(item: &ParsedItem) -> [(&'static str, Vec<usize>); 5] {
         }
     }
     [
+        ("Pseudo totals", pseudo),
         ("Enchants", enchants),
         ("Implicits", implicits),
         ("Prefixes", prefixes),
@@ -513,7 +653,7 @@ fn type_badge(mod_type: ModType) -> Option<(&'static str, Color)> {
         ModType::Fractured => Some(("fractured", Color::from_rgb8(0xc8, 0xa0, 0x5a))),
         ModType::Veiled => Some(("veiled", Color::from_rgb8(0xb0, 0x6a, 0xd0))),
         ModType::Scourge => Some(("scourge", Color::from_rgb8(0xd0, 0x64, 0x50))),
-        ModType::Enchant | ModType::Implicit | ModType::Explicit => None,
+        ModType::Enchant | ModType::Implicit | ModType::Explicit | ModType::Pseudo => None,
     }
 }
 

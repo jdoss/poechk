@@ -31,6 +31,8 @@ pub enum ModType {
     Fractured,
     Scourge,
     Veiled,
+    /// A synthetic sum of related mods (total resistance, total life).
+    Pseudo,
 }
 
 impl ModType {
@@ -44,6 +46,7 @@ impl ModType {
             ModType::Fractured => "fractured",
             ModType::Scourge => "scourge",
             ModType::Veiled => "veiled",
+            ModType::Pseudo => "pseudo",
         }
     }
 
@@ -121,6 +124,10 @@ pub struct ParsedMod {
     /// optionally be searched as ordinary explicit mods.
     #[serde(default)]
     pub explicit_ids: Vec<String>,
+    /// Per-stat pseudo id (item-wide total), when the trade API has one and
+    /// the mod resolved to the global stat variant.
+    #[serde(default)]
+    pub pseudo_ids: Vec<String>,
 }
 
 impl ParsedMod {
@@ -244,6 +251,14 @@ pub fn parse_mod(
             } else {
                 stat.trade_ids.get("explicit").cloned().unwrap_or_default()
             };
+            // Local variants (category-scoped) must not get the global total.
+            let pseudo_ids = if stat.category_test.is_none() {
+                crate::item::pseudo::per_stat_pseudo_id(&stat.stat_ref)
+                    .map(|id| vec![id.to_string()])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             return Some(ParsedMod {
                 text: body.to_string(),
                 mod_type,
@@ -253,6 +268,7 @@ pub fn parse_mod(
                 stat_ref: stat.stat_ref.clone(),
                 trade_ids: ids.clone(),
                 explicit_ids,
+                pseudo_ids,
             });
         }
     }

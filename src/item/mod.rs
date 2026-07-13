@@ -2,6 +2,7 @@
 
 pub mod mods;
 pub mod parse;
+pub mod pseudo;
 
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +98,14 @@ pub struct ParsedItem {
     pub sockets: Option<u8>,
     /// Size of the largest linked socket group.
     pub links: Option<u8>,
+    /// Average physical hit damage (midpoint of the damage range).
+    pub phys_damage: Option<f64>,
+    /// Average elemental hit damage (sum of each range's midpoint).
+    pub ele_damage: Option<f64>,
+    /// Average chaos hit damage.
+    pub chaos_damage: Option<f64>,
+    /// Attacks per second.
+    pub aps: Option<f64>,
     pub corrupted: bool,
     pub mirrored: bool,
     pub unidentified: bool,
@@ -110,4 +119,26 @@ pub struct ParsedItem {
     pub unknown_mods: Vec<String>,
     /// The original clipboard text, kept for poeprices.info and debugging.
     pub raw_text: String,
+}
+
+impl ParsedItem {
+    /// Physical DPS: average physical damage × attacks per second.
+    pub fn pdps(&self) -> Option<f64> {
+        Some(self.phys_damage? * self.aps?)
+    }
+
+    /// Elemental DPS: average elemental damage × attacks per second.
+    pub fn edps(&self) -> Option<f64> {
+        Some(self.ele_damage? * self.aps?)
+    }
+
+    /// Total DPS across physical, elemental, and chaos damage.
+    pub fn total_dps(&self) -> Option<f64> {
+        let aps = self.aps?;
+        let damage = [self.phys_damage, self.ele_damage, self.chaos_damage];
+        if damage.iter().all(Option::is_none) {
+            return None;
+        }
+        Some(damage.iter().flatten().sum::<f64>() * aps)
+    }
 }

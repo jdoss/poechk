@@ -37,6 +37,9 @@ pub struct FilterSpec {
     /// Search the mod as a plain explicit instead of its special type
     /// (fractured/crafted/…), matching it on any item regardless of provenance.
     pub as_explicit: bool,
+    /// Search the mod's per-stat pseudo total (item-wide sum) when available.
+    /// Takes precedence over `as_explicit`.
+    pub use_pseudo: bool,
     pub min: Option<f64>,
     pub max: Option<f64>,
 }
@@ -88,6 +91,12 @@ pub struct MiscFilters {
     pub sockets_min: Option<u8>,
     /// Minimum size of the largest linked group.
     pub links_min: Option<u8>,
+    /// Minimum total DPS (weapons).
+    pub dps_min: Option<f64>,
+    /// Minimum physical DPS (weapons).
+    pub pdps_min: Option<f64>,
+    /// Minimum elemental DPS (weapons).
+    pub edps_min: Option<f64>,
 }
 
 /// The outcome of a price search: the search id (for the trade URL), the total
@@ -139,6 +148,22 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
         filter_groups.insert(
             "socket_filters".to_string(),
             json!({ "filters": Value::Object(socket_filters) }),
+        );
+    }
+    let mut weapon_filters = serde_json::Map::new();
+    if let Some(dps) = misc.dps_min {
+        weapon_filters.insert("dps".to_string(), json!({ "min": dps }));
+    }
+    if let Some(pdps) = misc.pdps_min {
+        weapon_filters.insert("pdps".to_string(), json!({ "min": pdps }));
+    }
+    if let Some(edps) = misc.edps_min {
+        weapon_filters.insert("edps".to_string(), json!({ "min": edps }));
+    }
+    if !weapon_filters.is_empty() {
+        filter_groups.insert(
+            "weapon_filters".to_string(),
+            json!({ "filters": Value::Object(weapon_filters) }),
         );
     }
     if !filter_groups.is_empty() {
@@ -226,6 +251,7 @@ pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
         .map(|m| FilterSpec {
             enabled: enabled && m.mod_type != crate::item::mods::ModType::Crafted,
             as_explicit: false,
+            use_pseudo: !m.pseudo_ids.is_empty(),
             min: m.roll().map(f64::floor),
             max: None,
         })
@@ -234,7 +260,9 @@ pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
 
 /// One trade stat filter for a resolved mod, or `None` if it has no trade id.
 fn stat_filter(m: &crate::item::mods::ParsedMod, spec: &FilterSpec) -> Option<Value> {
-    let ids = if spec.as_explicit && !m.explicit_ids.is_empty() {
+    let ids = if spec.use_pseudo && !m.pseudo_ids.is_empty() {
+        &m.pseudo_ids
+    } else if spec.as_explicit && !m.explicit_ids.is_empty() {
         &m.explicit_ids
     } else {
         &m.trade_ids
@@ -456,6 +484,7 @@ mod tests {
             stat_ref: stat_ref.to_string(),
             trade_ids: vec![id.to_string()],
             explicit_ids: vec![id.to_string()],
+            pseudo_ids: vec![],
         }
     }
 
@@ -500,6 +529,29 @@ mod tests {
     }
 
     #[test]
+    fn weapon_dps_filters() {
+        let item = ParsedItem {
+            base_type: "Jewelled Foil".to_string(),
+            rarity: Some(Rarity::Rare),
+            ..Default::default()
+        };
+        let body = build_search_body(
+            &item,
+            &[],
+            &MiscFilters {
+                pdps_min: Some(98.0),
+                edps_min: Some(283.0),
+                dps_min: Some(381.0),
+                ..Default::default()
+            },
+        );
+        let weapon = &body["query"]["filters"]["weapon_filters"]["filters"];
+        assert_eq!(weapon["pdps"]["min"], 98.0);
+        assert_eq!(weapon["edps"]["min"], 283.0);
+        assert_eq!(weapon["dps"]["min"], 381.0);
+    }
+
+    #[test]
     fn as_explicit_downgrades_special_types() {
         let mut fractured = mod_with("+# to maximum Life", "fractured.stat_3299347043", Some(80.0));
         fractured.mod_type = ModType::Fractured;
@@ -513,7 +565,13 @@ mod tests {
 
         let typed = build_search_body(
             &item,
-            &[FilterSpec { enabled: true, as_explicit: false, min: Some(80.0), max: None }],
+            &[FilterSpec {
+                enabled: true,
+                as_explicit: false,
+                use_pseudo: false,
+                min: Some(80.0),
+                max: None,
+            }],
             &MiscFilters::default(),
         );
         assert_eq!(
@@ -523,7 +581,13 @@ mod tests {
 
         let downgraded = build_search_body(
             &item,
-            &[FilterSpec { enabled: true, as_explicit: true, min: Some(80.0), max: None }],
+            &[FilterSpec {
+                enabled: true,
+                as_explicit: true,
+                use_pseudo: false,
+                min: Some(80.0),
+                max: None,
+            }],
             &MiscFilters::default(),
         );
         assert_eq!(
