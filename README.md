@@ -9,7 +9,7 @@ Hover an item in game, press **Ctrl+Alt+D**, and a layer-shell overlay pops up
 with the item parsed into adjustable trade filters and live prices from the
 official trade site.
 
-<!-- screenshot: docs/screenshot.png -->
+![poechk overlay pricing a fractured shield in game](docs/screenshot.png)
 
 ## Features
 
