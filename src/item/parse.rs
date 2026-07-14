@@ -105,6 +105,7 @@ pub fn parse_item(
     let mut item = parse_name_plate(text, game)?;
     // Resolve the category first: local/global stat variants depend on it.
     item.category = resolve_category(&item, items);
+    item.trade_tag = items.trade_tag(&item.base_type).map(str::to_string);
     let sections = split_sections(text);
     let mut context: Option<(ModType, Option<Slot>)> = None;
 
@@ -355,6 +356,14 @@ Fractured Item
         assert_eq!(item.rarity, Some(Rarity::Currency));
         assert_eq!(item.name, None);
         assert_eq!(item.base_type, "Chaos Orb");
+    }
+
+    #[test]
+    fn currency_resolves_a_bulk_trade_tag() {
+        let stats = load_stats();
+        let items = load_items();
+        let item = parse_item(CHAOS_ORB, Game::Poe1, &stats, &items).unwrap();
+        assert_eq!(item.trade_tag.as_deref(), Some("chaos"));
     }
 
     #[test]

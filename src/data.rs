@@ -230,6 +230,15 @@ impl ItemIndex {
         self.by_key.get(&format!("UNIQUE::{name}"))
     }
 
+    /// The bulk-exchange trade tag for a name (currency, fragments, cards, …).
+    pub fn trade_tag(&self, name: &str) -> Option<&str> {
+        ["ITEM", "DIVINATION_CARD"].iter().find_map(|ns| {
+            self.by_key
+                .get(&format!("{ns}::{name}"))
+                .and_then(|item| item.trade_tag.as_deref())
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.by_key.len()
     }

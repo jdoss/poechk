@@ -26,7 +26,6 @@ use crate::item::{ParsedItem, Rarity};
 use crate::price::PriceQuote;
 use crate::price::trade::{
     self, FilterSpec, MiscFilters, PriceResult, Status, TradeSource, cached_leagues, fetch_leagues,
-    search_url,
 };
 
 const CARD_WIDTH: u32 = 540;
@@ -67,7 +66,7 @@ type SearchOutcome = Result<PriceResult, String>;
 enum SearchState {
     Idle,
     Searching,
-    Done(u32, Vec<PriceQuote>),
+    Done(PriceResult),
     Failed(String),
 }
 
@@ -119,6 +118,9 @@ struct Overlay {
     item: ParsedItem,
     config: Config,
     leagues: Vec<String>,
+    /// Bulk-exchange tag: currency/fragments/cards price per unit on the
+    /// exchange instead of the item search.
+    bulk_tag: Option<String>,
     rows: Vec<FilterRow>,
     /// Minimum sockets / links filters, as editable text ("" = no filter).
     sockets_min: String,
@@ -228,10 +230,16 @@ impl Overlay {
             _ => {}
         }
 
+        let bulk_tag = match item.rarity {
+            Some(Rarity::Currency) | Some(Rarity::DivinationCard) => item.trade_tag.clone(),
+            _ => None,
+        };
+
         let state = Overlay {
             item,
             config,
             leagues,
+            bulk_tag,
             rows,
             sockets_min,
             links_min,
@@ -288,12 +296,16 @@ impl Overlay {
             }
             Message::Search => {
                 self.search = SearchState::Searching;
-                search_task(
-                    self.item.clone(),
-                    self.config.clone(),
-                    self.specs(),
-                    self.misc(),
-                )
+                if self.bulk_tag.is_some() {
+                    bulk_search_task(self.item.base_type.clone(), self.config.clone())
+                } else {
+                    search_task(
+                        self.item.clone(),
+                        self.config.clone(),
+                        self.specs(),
+                        self.misc(),
+                    )
+                }
             }
             Message::OpenBrowser => {
                 if let Some(url) = &self.trade_url {
@@ -302,8 +314,8 @@ impl Overlay {
                 Task::none()
             }
             Message::Searched(Ok(result)) => {
-                self.trade_url = Some(search_url(&self.config.league, &result.search_id));
-                self.search = SearchState::Done(result.total, result.quotes);
+                self.trade_url = Some(result.url.clone());
+                self.search = SearchState::Done(result);
                 Task::none()
             }
             Message::Searched(Err(err)) => {
@@ -405,7 +417,8 @@ impl Overlay {
                 ),
         );
 
-        if let Some(dps) = item.total_dps() {
+        let bulk = self.bulk_tag.is_some();
+        if !bulk && let Some(dps) = item.total_dps() {
             let mut parts = vec![format!("DPS {}", fmt_amount(dps))];
             if let Some(pdps) = item.pdps() {
                 parts.push(format!("pDPS {}", fmt_amount(pdps)));
@@ -448,7 +461,7 @@ impl Overlay {
             );
         }
 
-        if item.sockets.is_some() {
+        if !bulk && item.sockets.is_some() {
             col = col.push(
                 Row::new()
                     .spacing(6)
@@ -472,33 +485,36 @@ impl Overlay {
             );
         }
 
-        for (title, indices) in affix_sections(item) {
-            if indices.is_empty() {
-                continue;
-            }
-            col = col.push(text(title).size(10.0).color(SECTION_COLOR));
-            for index in indices {
-                col = col.push(self.affix_row(index));
+        if !bulk {
+            for (title, indices) in affix_sections(item) {
+                if indices.is_empty() {
+                    continue;
+                }
+                col = col.push(text(title).size(10.0).color(SECTION_COLOR));
+                for index in indices {
+                    col = col.push(self.affix_row(index));
+                }
             }
         }
 
-        let controls = Row::new()
-            .spacing(8)
-            .push(
-                button(text("Search").size(14.0))
-                    .on_press(Message::Search)
-                    .padding([6, 16]),
-            )
-            .push(
-                button(text(self.status.label()).size(13.0))
-                    .on_press(Message::CycleStatus)
-                    .padding([6, 10]),
-            )
-            .push(
-                button(text(format!("Corrupted: {}", self.corrupted.label())).size(13.0))
-                    .on_press(Message::CycleCorrupted)
-                    .padding([6, 10]),
-            );
+        let mut controls = Row::new().spacing(8).push(
+            button(text("Search").size(14.0))
+                .on_press(Message::Search)
+                .padding([6, 16]),
+        );
+        if !bulk {
+            controls = controls
+                .push(
+                    button(text(self.status.label()).size(13.0))
+                        .on_press(Message::CycleStatus)
+                        .padding([6, 10]),
+                )
+                .push(
+                    button(text(format!("Corrupted: {}", self.corrupted.label())).size(13.0))
+                        .on_press(Message::CycleCorrupted)
+                        .padding([6, 10]),
+                );
+        }
         col = col.push(controls);
         col = col.push(text("────────").size(10.0));
         col = col.push(results_view(&self.search));
@@ -657,6 +673,34 @@ fn type_badge(mod_type: ModType) -> Option<(&'static str, Color)> {
     }
 }
 
+/// Look up the poe.ninja price on a worker thread; deliver the result to iced.
+///
+/// Currency and other exchangeables trade on the in-game currency exchange,
+/// whose rates poe.ninja publishes — trade-site bulk listings are leftovers,
+/// so they are not queried at all.
+fn bulk_search_task(name: String, config: Config) -> Task<Message> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let outcome = match crate::price::ninja::chaos_value(&config.league, &name) {
+            Some(ninja) => Ok(PriceResult {
+                url: format!(
+                    "https://www.pathofexile.com/trade/exchange/{}",
+                    config.league.replace(' ', "%20")
+                ),
+                total: 0,
+                quotes: Vec::new(),
+                ninja_chaos: Some(ninja),
+            }),
+            None => Err(format!("poe.ninja has no price for \"{name}\"")),
+        };
+        let _ = tx.send(outcome);
+    });
+    Task::perform(
+        async move { rx.await.unwrap_or_else(|_| Err("search cancelled".to_string())) },
+        Message::Searched,
+    )
+}
+
 /// Run the trade search on a worker thread; deliver the result to iced.
 fn search_task(
     item: ParsedItem,
@@ -701,15 +745,23 @@ fn results_view(search: &SearchState) -> Element<'_, Message> {
         SearchState::Idle => text("Press Search to price").size(13.0).into(),
         SearchState::Searching => text("Searching…").size(13.0).into(),
         SearchState::Failed(err) => text(format!("Search failed: {err}")).size(12.0).into(),
-        SearchState::Done(total, quotes) if quotes.is_empty() => {
-            text(format!("No listings ({total} matched)")).size(13.0).into()
-        }
-        SearchState::Done(total, quotes) => {
+        SearchState::Done(result) => {
             let mut col = Column::new().spacing(2);
-            for (label, count) in price_bands(quotes) {
-                col = col.push(text(format!("{label}  ×{count}")).size(16.0));
+            if let Some(ninja) = result.ninja_chaos {
+                col = col.push(text(format!("≈ {} chaos", fmt_amount(ninja))).size(17.0));
+                col = col.push(
+                    text("poe.ninja · in-game exchange rate")
+                        .size(10.0)
+                        .color(SECTION_COLOR),
+                );
+            } else if result.quotes.is_empty() {
+                col = col.push(text(format!("No listings ({} matched)", result.total)).size(13.0));
+            } else {
+                for (label, count) in price_bands(&result.quotes) {
+                    col = col.push(text(format!("{label}  ×{count}")).size(16.0));
+                }
+                col = col.push(text(format!("{} listed", result.total)).size(12.0));
             }
-            col = col.push(text(format!("{total} listed")).size(12.0));
             col.into()
         }
     }
@@ -756,6 +808,8 @@ fn price_bands(quotes: &[PriceQuote]) -> Vec<(String, usize)> {
 fn fmt_amount(amount: f64) -> String {
     if amount.fract() == 0.0 {
         format!("{}", amount as i64)
+    } else if amount < 1.0 {
+        format!("{amount:.2}")
     } else {
         format!("{amount:.1}")
     }

@@ -99,13 +99,17 @@ pub struct MiscFilters {
     pub edps_min: Option<f64>,
 }
 
-/// The outcome of a price search: the search id (for the trade URL), the total
-/// match count, and the cheapest listings.
+/// The outcome of a price search: the trade-site URL for it, the total match
+/// count, and the cheapest listings.
 #[derive(Debug, Clone)]
 pub struct PriceResult {
-    pub search_id: String,
+    /// pathofexile.com URL reproducing this search (item search or exchange).
+    pub url: String,
     pub total: u32,
     pub quotes: Vec<PriceQuote>,
+    /// poe.ninja reference value in chaos (bulk items; sourced from the
+    /// in-game currency exchange where applicable).
+    pub ninja_chaos: Option<f64>,
 }
 
 pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscFilters) -> Value {
@@ -181,6 +185,7 @@ pub fn search_url(league: &str, search_id: &str) -> String {
         search_id
     )
 }
+
 
 #[derive(Deserialize)]
 struct ApiLeague {
@@ -383,11 +388,13 @@ impl TradeSource {
 
         limiter.wait("search");
         let search = self.search(&body, &limiter)?;
+        let url = search_url(&self.league, &search.id);
         if search.result.is_empty() {
             return Ok(PriceResult {
-                search_id: search.id,
+                url,
                 total: search.total,
                 quotes: Vec::new(),
+                ninja_chaos: None,
             });
         }
         let ids: Vec<String> = search.result.iter().take(FETCH_LIMIT).cloned().collect();
@@ -407,9 +414,10 @@ impl TradeSource {
             })
             .collect();
         Ok(PriceResult {
-            search_id: search.id,
+            url,
             total: search.total,
             quotes,
+            ninja_chaos: None,
         })
     }
 

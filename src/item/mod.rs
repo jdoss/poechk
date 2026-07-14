@@ -92,6 +92,8 @@ pub struct ParsedItem {
     pub base_type: String,
     /// Resolved item category (e.g. "bow"), when the base type is known.
     pub category: Option<String>,
+    /// Bulk-exchange trade tag (currency, fragments, cards) when one exists.
+    pub trade_tag: Option<String>,
     pub item_level: Option<u32>,
     pub quality: Option<u32>,
     /// Total number of sockets.
