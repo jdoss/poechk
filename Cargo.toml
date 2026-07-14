@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.87"
 description = "Path of Exile price-check overlay for the COSMIC desktop"
 license = "MIT"
+repository = "https://github.com/jdoss/poechk"
 
 [dependencies]
 anyhow = "1.0.103"

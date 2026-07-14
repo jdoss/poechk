@@ -1,5 +1,12 @@
 # poechk — design & roadmap
 
+> **Status (2026-07):** M0–M5 shipped. The daemon described below was never
+> needed — `check` does everything in-process, and the poe.ninja disk cache
+> plus the file-based rate limiter cover the state the daemon was meant to
+> hold. poeprices.info was dropped in favor of poe.ninja (whose currency rates
+> come from the in-game exchange). This document is otherwise kept as written
+> for design history; README.md describes the tool as it exists.
+
 A Path of Exile price-check overlay for the **COSMIC** desktop, in the spirit of
 [Awakened PoE Trade][apt] but native to Wayland/COSMIC and written in Rust — no
 Electron, no TypeScript. It reuses the process architecture of [clipbro][clipbro].

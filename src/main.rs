@@ -10,11 +10,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the long-lived daemon (owns config, cache, rate limiters, IPC service).
-    Daemon,
-    /// Render the overlay for a result JSON file (spawned by the daemon; also handy for testing).
+    /// Render the overlay for a saved item JSON file (development aid).
     Overlay {
-        /// Path to a JSON `PriceCheckResult` to display.
+        /// Path to a JSON `ParsedItem` to display.
         #[arg(long, value_name = "PATH")]
         result: std::path::PathBuf,
     },
@@ -35,7 +33,6 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Daemon => poechk::daemon::run(),
         Command::Overlay { result } => poechk::overlay::run_from_file(&result),
         Command::Check { copy } => poechk::check::run(copy),
     }
