@@ -241,10 +241,13 @@ pub fn parse_mod(
             .copied();
         if let Some(stat) = chosen {
             let ids = &stat.trade_ids[key];
+            // "reduced" matchers map to the "increased" stat with the sign
+            // flipped (60% reduced mana == -60% increased mana).
+            let sign = if stat.negate { -1.0 } else { 1.0 };
             let rolls = if candidate_rolls.is_empty() {
                 stat.value.map(|v| vec![v]).unwrap_or_default()
             } else {
-                candidate_rolls.clone()
+                candidate_rolls.iter().map(|roll| roll * sign).collect()
             };
             let explicit_ids = if key == "explicit" {
                 ids.clone()
@@ -360,6 +363,15 @@ mod tests {
     fn unknown_mod_returns_none() {
         let stats = load_stats();
         assert!(parse_mod("Totally Not A Real Mod", &stats, None, None).is_none());
+    }
+
+    #[test]
+    fn reduced_mods_negate_the_roll() {
+        let stats = load_stats();
+        let m = parse_mod("60% reduced maximum Mana", &stats, None, None)
+            .expect("reduced mana resolves");
+        assert_eq!(m.stat_ref, "#% increased maximum Mana");
+        assert_eq!(m.roll(), Some(-60.0));
     }
 
     #[test]

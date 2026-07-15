@@ -435,10 +435,20 @@ impl TradeSource {
             req = req.header("Cookie", format!("POESESSID={sess}"));
         }
         let mut resp = req
+            .config()
+            .http_status_as_error(false)
+            .build()
             .send_json(body)
             .map_err(|e| anyhow::anyhow!("trade search request failed: {e}"))?;
         if let Some(interval) = interval_from_headers(resp.headers(), self.latency_margin) {
             limiter.record("search", interval);
+        }
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            anyhow::bail!(
+                "trade search rejected ({})",
+                crate::price::api_error(status, resp.body_mut())
+            );
         }
         resp.body_mut()
             .read_json()
@@ -464,10 +474,20 @@ impl TradeSource {
             req = req.header("Cookie", format!("POESESSID={sess}"));
         }
         let mut resp = req
+            .config()
+            .http_status_as_error(false)
+            .build()
             .call()
             .map_err(|e| anyhow::anyhow!("trade fetch request failed: {e}"))?;
         if let Some(interval) = interval_from_headers(resp.headers(), self.latency_margin) {
             limiter.record("fetch", interval);
+        }
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            anyhow::bail!(
+                "trade fetch rejected ({})",
+                crate::price::api_error(status, resp.body_mut())
+            );
         }
         let parsed: FetchResponse = resp
             .body_mut()
