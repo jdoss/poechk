@@ -93,6 +93,20 @@ If you'd rather not have poechk inject the copy keystroke, bind the shortcut
 to `poechk check` (without `--copy`) and press Ctrl+Alt+C yourself before the
 hotkey.
 
+## Logging in (optional)
+
+Searches work without an account, but unauthenticated rate limits are low. To
+search as your account (higher limits, private leagues), give poechk your
+trade-site session cookie in `~/.config/poechk/config.toml`:
+
+```toml
+poesessid = "your-cookie-value"
+```
+
+Get the value from a browser logged into pathofexile.com: DevTools → Storage/
+Application → Cookies → `POESESSID`. Treat it like a password — it is your
+login. poechk only sends it to `www.pathofexile.com`.
+
 ## How it works
 
 One binary, no daemon. The COSMIC shortcut spawns `poechk check --copy`,

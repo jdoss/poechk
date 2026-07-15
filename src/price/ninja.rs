@@ -68,8 +68,18 @@ fn fetch(league: &str) -> anyhow::Result<HashMap<String, f64>> {
     );
     let mut resp = ureq::get(&url)
         .header("User-Agent", USER_AGENT)
+        .config()
+        .http_status_as_error(false)
+        .build()
         .call()
         .map_err(|e| anyhow::anyhow!("poe.ninja request failed: {e}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        anyhow::bail!(
+            "poe.ninja rejected the request ({}) — it may not track league \"{league}\"",
+            crate::price::api_error(status, resp.body_mut())
+        );
+    }
     let blob: Value = resp
         .body_mut()
         .with_config()
