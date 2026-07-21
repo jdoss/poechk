@@ -2,8 +2,10 @@
 //!
 //! Daemonless: `check` does the work in-process and hands the parsed item to the
 //! interactive overlay, which runs the trade searches. With `--copy` it first
-//! injects Ctrl+Alt+C into the focused game (via wtype / the virtual-keyboard
-//! protocol) so one hotkey does copy + price check, like Awakened PoE Trade.
+//! injects Ctrl+Alt+C into the focused game (via XTest, see `inject`) so one
+//! hotkey does copy + price check, like Awakened PoE Trade.
+
+use std::time::Duration;
 
 use anyhow::Context;
 
@@ -11,6 +13,17 @@ use crate::{config, item, overlay};
 
 /// Sentinel seeded onto the clipboard so the game's copy is detectable.
 const COPY_SENTINEL: &str = "POECHK_AWAITING_ITEM_COPY";
+
+/// Full copy attempts before giving up. Proton 11 / Wine 11 routinely drops the
+/// first copy (see `capture_item_text`), so we retry the whole chord — the same
+/// thing pressing the hotkey a second time does by hand.
+const COPY_ATTEMPTS: usize = 4;
+
+/// Clipboard reads per attempt, spaced by `POLL_GAP`.
+const POLLS_PER_ATTEMPT: usize = 6;
+
+/// Gap between clipboard reads while waiting for the copy to land.
+const POLL_GAP: Duration = Duration::from_millis(40);
 
 /// Price-check an item: optionally copy it from the game first, then parse the
 /// clipboard and show the interactive overlay.
@@ -41,28 +54,44 @@ pub fn run(copy: bool) -> anyhow::Result<()> {
 
 /// Copy the hovered item from the game, waiting for it to land on the clipboard.
 ///
-/// Seeds the clipboard with a sentinel (so a stale item can't be mistaken for
-/// the new copy), fakes Ctrl+Alt+C into the still-focused game via XTest, then
-/// polls the clipboard briefly — the same approach Awakened PoE Trade uses.
+/// Each attempt seeds the clipboard with a sentinel (so a stale item can't be
+/// mistaken for the new copy), fakes Ctrl+Alt+C into the still-focused game via
+/// XTest, then polls the clipboard briefly — the approach Awakened PoE Trade uses.
+///
+/// Proton 11 / Wine 11 regressed the game's clipboard: it commits the copy
+/// late (often only once the window loses focus), so the first attempt usually
+/// polls out. Re-running the whole chord flushes it — automating the "press the
+/// hotkey twice" that works by hand, which no single clipboard poke reproduced.
 fn capture_item_text() -> anyhow::Result<String> {
+    for _ in 0..COPY_ATTEMPTS {
+        seed_clipboard()?;
+        crate::inject::send_copy_chord().context("injecting Ctrl+Alt+C into the game")?;
+        for _ in 0..POLLS_PER_ATTEMPT {
+            std::thread::sleep(POLL_GAP);
+            if let Some(text) = clipboard_text()
+                && text != COPY_SENTINEL
+                && looks_like_item(&text)
+            {
+                return Ok(text);
+            }
+        }
+    }
+    anyhow::bail!(
+        "timed out waiting for the item copy. Hover an item with the game focused. \
+         If this persists on Proton 11, force Proton 10 (Steam → Properties → \
+         Compatibility) — Wine 11 has a clipboard regression that breaks the copy."
+    )
+}
+
+/// Seed the clipboard with the sentinel, replacing whatever owns it, so the
+/// game's copy is distinguishable from a stale item still on the clipboard.
+fn seed_clipboard() -> anyhow::Result<()> {
     let seeded = std::process::Command::new("wl-copy")
         .arg(COPY_SENTINEL)
         .status()
         .context("running wl-copy (is wl-clipboard installed?)")?;
     anyhow::ensure!(seeded.success(), "wl-copy failed to seed the clipboard");
-
-    crate::inject::send_copy_chord().context("injecting Ctrl+Alt+C into the game")?;
-
-    for _ in 0..16 {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        if let Some(text) = clipboard_text()
-            && text != COPY_SENTINEL
-            && looks_like_item(&text)
-        {
-            return Ok(text);
-        }
-    }
-    anyhow::bail!("timed out waiting for the item copy — is the game focused with an item hovered?")
+    Ok(())
 }
 
 /// Whether clipboard text is plausibly a PoE item (cheap pre-parse check).
