@@ -31,12 +31,18 @@ struct Matcher {
 struct Trade {
     #[serde(default)]
     ids: HashMap<String, Vec<String>>,
+    /// The stat is picked from a fixed list on the trade site (cluster jewel
+    /// enchants, "Allocates #", …); each matcher's `value` is its option id.
+    #[serde(default)]
+    option: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Stat {
     #[serde(rename = "ref")]
     ref_: String,
+    /// Which roll direction is desirable: `1` higher, `-1` lower, `0` neither.
+    better: i8,
     matchers: Vec<Matcher>,
     trade: Trade,
 }
@@ -71,8 +77,14 @@ pub struct StatMatch {
     pub stat_ref: String,
     /// Trade stat-ids keyed by mod type (explicit/implicit/fractured/…).
     pub trade_ids: HashMap<String, Vec<String>>,
-    /// Fixed value for non-numeric matchers (e.g. "on Hit" == 100).
+    /// Fixed value for non-numeric matchers (e.g. "on Hit" == 100). For an
+    /// option stat this is the trade option id rather than a roll.
     pub value: Option<f64>,
+    /// Whether the stat is searched by option id instead of a numeric roll.
+    pub is_option: bool,
+    /// Whether a lower roll makes the item better (a cluster jewel's passive
+    /// count, an attribute requirement), so the filter caps instead of floors.
+    pub lower_is_better: bool,
     /// Whether the roll should be negated when comparing.
     pub negate: bool,
     /// For select-group members: the item-category (set) this variant applies
@@ -142,6 +154,8 @@ fn index_stat(
             stat_ref: stat.ref_.clone(),
             trade_ids: stat.trade.ids.clone(),
             value: matcher.value,
+            is_option: stat.trade.option,
+            lower_is_better: stat.better < 0,
             negate: matcher.negate.unwrap_or(false),
             category_test: category_test.clone(),
         };

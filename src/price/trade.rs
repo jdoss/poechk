@@ -247,18 +247,23 @@ fn save_league_cache(ids: &[String]) {
 
 /// Default filters: a unique's affix rolls vary widely, so it is searched by
 /// name with affixes off; everything else filters on all resolved affixes at
-/// their current roll (min = roll, no max). Crafted mods start disabled — any
-/// buyer can re-craft them, so they shouldn't constrain the search.
+/// their current roll. The roll seeds the floor (min = roll) normally, and the
+/// cap (max = roll) for stats where less is better — a cluster jewel's added
+/// passive count, where 8/8 beats 9/8. Crafted mods start disabled: any buyer
+/// can re-craft them, so they shouldn't constrain the search.
 pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
     let enabled = item.rarity != Some(Rarity::Unique);
     item.mods
         .iter()
-        .map(|m| FilterSpec {
-            enabled: enabled && m.mod_type != crate::item::mods::ModType::Crafted,
-            as_explicit: false,
-            use_pseudo: !m.pseudo_ids.is_empty(),
-            min: m.roll().map(f64::floor),
-            max: None,
+        .map(|m| {
+            let roll = m.roll();
+            FilterSpec {
+                enabled: enabled && m.mod_type != crate::item::mods::ModType::Crafted,
+                as_explicit: false,
+                use_pseudo: !m.pseudo_ids.is_empty(),
+                min: roll.filter(|_| !m.lower_is_better).map(f64::floor),
+                max: roll.filter(|_| m.lower_is_better).map(f64::ceil),
+            }
         })
         .collect()
 }
@@ -274,17 +279,24 @@ fn stat_filter(m: &crate::item::mods::ParsedMod, spec: &FilterSpec) -> Option<Va
     };
     let id = ids.first()?;
     let mut filter = json!({ "id": id, "disabled": !spec.enabled });
-    if spec.enabled {
-        let mut value = serde_json::Map::new();
-        if let Some(min) = spec.min {
-            value.insert("min".to_string(), json!(min));
-        }
-        if let Some(max) = spec.max {
-            value.insert("max".to_string(), json!(max));
-        }
-        if !value.is_empty() {
-            filter["value"] = Value::Object(value);
-        }
+    if !spec.enabled {
+        return Some(filter);
+    }
+    // An option stat picks one entry from the trade site's list (which cluster
+    // jewel enchant, which allocated notable) — it has no range to bound.
+    if let Some(option) = m.option {
+        filter["value"] = json!({ "option": option });
+        return Some(filter);
+    }
+    let mut value = serde_json::Map::new();
+    if let Some(min) = spec.min {
+        value.insert("min".to_string(), json!(min));
+    }
+    if let Some(max) = spec.max {
+        value.insert("max".to_string(), json!(max));
+    }
+    if !value.is_empty() {
+        filter["value"] = Value::Object(value);
     }
     Some(filter)
 }
@@ -509,6 +521,8 @@ mod tests {
             slot: None,
             template: stat_ref.to_string(),
             rolls: roll.map(|r| vec![r]).unwrap_or_default(),
+            option: None,
+            lower_is_better: false,
             stat_ref: stat_ref.to_string(),
             trade_ids: vec![id.to_string()],
             explicit_ids: vec![id.to_string()],
@@ -673,6 +687,50 @@ mod tests {
         let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
         assert_eq!(filters[0]["disabled"], true);
         assert!(filters[0].get("value").is_none());
+    }
+
+    #[test]
+    fn cluster_jewel_searches_by_option_and_caps_the_passive_count() {
+        const CLUSTER_JEWEL: &str = r#"Item Class: Jewels
+Rarity: Magic
+Large Cluster Jewel of the Lost
+--------
+Item Level: 84
+--------
+Adds 8 Passive Skills (enchant)
+1 Added Passive Skill is a Jewel Socket (enchant)
+Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
+"#;
+        let stats = crate::data::load_stats();
+        let items = crate::data::load_items();
+        let item =
+            crate::item::parse::parse_item(CLUSTER_JEWEL, crate::item::Game::Poe1, &stats, &items)
+                .unwrap();
+        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+
+        assert_eq!(body["query"]["type"], "Large Cluster Jewel");
+        let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
+        let by_id = |id: &str| {
+            filters
+                .iter()
+                .find(|f| f["id"] == id)
+                .unwrap_or_else(|| panic!("no filter for {id}"))
+        };
+
+        // The enchant text picks a trade option, not a numeric range.
+        let granted = by_id("enchant.stat_3948993189");
+        assert_eq!(granted["value"]["option"], 17);
+        assert!(granted["value"].get("min").is_none());
+
+        // Fewer added passives is better, so 8 is the cap, not the floor.
+        let passives = by_id("enchant.stat_3086156145");
+        assert_eq!(passives["value"]["max"], 8.0);
+        assert!(passives["value"].get("min").is_none());
+
+        // More jewel sockets is better, so that one keeps its floor.
+        let sockets = by_id("enchant.stat_4079888060");
+        assert_eq!(sockets["value"]["min"], 1.0);
+        assert!(sockets["value"].get("max").is_none());
     }
 
     #[test]

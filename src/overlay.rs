@@ -179,7 +179,7 @@ impl Overlay {
                 typed: true,
                 pseudo: spec.use_pseudo,
                 min: spec.min.map(fmt_amount).unwrap_or_default(),
-                max: String::new(),
+                max: spec.max.map(fmt_amount).unwrap_or_default(),
             })
             .collect();
 
@@ -564,22 +564,27 @@ impl Overlay {
                     .style(move |_theme, _status| badge_style(PSEUDO_COLOR, pseudo_on)),
             );
         }
-        row.push(text(parsed.text.clone()).size(13.0).width(Length::Fill))
-            .push(
-                text_input("min", &state.min)
-                    .on_input(move |v| Message::SetMin(index, v))
-                    .size(12.0)
-                    .padding(4)
-                    .width(Length::Fixed(56.0)),
-            )
-            .push(
-                text_input("max", &state.max)
-                    .on_input(move |v| Message::SetMax(index, v))
-                    .size(12.0)
-                    .padding(4)
-                    .width(Length::Fixed(56.0)),
-            )
-            .into()
+        row = row.push(text(parsed.text.clone()).size(13.0).width(Length::Fill));
+        // An option mod (a cluster jewel enchant, an allocated notable) matches
+        // by identity, so there is no range to type.
+        if parsed.option.is_some() {
+            return row.into();
+        }
+        row.push(
+            text_input("min", &state.min)
+                .on_input(move |v| Message::SetMin(index, v))
+                .size(12.0)
+                .padding(4)
+                .width(Length::Fixed(56.0)),
+        )
+        .push(
+            text_input("max", &state.max)
+                .on_input(move |v| Message::SetMax(index, v))
+                .size(12.0)
+                .padding(4)
+                .width(Length::Fixed(56.0)),
+        )
+        .into()
     }
 }
 

@@ -103,11 +103,18 @@ pub fn parse_item(
     items: &ItemIndex,
 ) -> Result<ParsedItem, ParseError> {
     let mut item = parse_name_plate(text, game)?;
+    // A magic item has no separate base line — its plate reads
+    // "Prefix Base of Suffix" — so recover the base type before the category,
+    // trade tag and search all key off it.
+    if item.rarity == Some(Rarity::Magic)
+        && let Some(base) = magic_base_type(&item.base_type, items)
+    {
+        item.base_type = base;
+    }
     // Resolve the category first: local/global stat variants depend on it.
     item.category = resolve_category(&item, items);
     item.trade_tag = items.trade_tag(&item.base_type).map(str::to_string);
     let sections = split_sections(text);
-    let mut context: Option<(ModType, Option<Slot>)> = None;
 
     for section in sections.iter().skip(1) {
         // The weapon/armour base-stats block holds Quality alongside the
@@ -120,39 +127,74 @@ pub fn parse_item(
             }
             continue;
         }
-        for line in section.iter().map(|l| l.trim()) {
-            // An advanced `{ … Modifier … }` info line sets the type and slot
-            // for the mods that follow it.
-            if let Some(info) = ModType::from_info_line(line) {
-                context = Some(info);
-                continue;
-            }
-            // Fully parenthesised lines are reminder/help text, not mods.
-            if line.starts_with('(') && line.ends_with(')') {
-                continue;
-            }
-            if parse_meta_value(line, &mut item) || parse_meta_flag(line, &mut item) {
-                continue;
-            }
-            // Skip requirements and other "Label: value" / section-head lines.
-            if line.contains(": ") || line.ends_with(':') {
-                continue;
-            }
-            match mods::parse_mod(line, stats, context, item.category.as_deref()) {
-                Some(parsed) => item.mods.push(parsed),
-                // Only surface unresolved lines that look like a rollable mod (a
-                // space and a digit) — skips unique flavour text and lone
-                // weapon-type headers.
-                None if line.contains(' ') && line.bytes().any(|b| b.is_ascii_digit()) => {
-                    item.unknown_mods.push(line.to_string());
-                }
-                None => {}
-            }
-        }
-        context = None;
+        parse_mod_section(section, stats, &mut item);
     }
 
     Ok(item)
+}
+
+/// Fold one affix section into `item`: `{ … }` info lines set the type and slot
+/// for the mods that follow, and every other line is resolved to a stat.
+fn parse_mod_section(section: &[&str], stats: &StatIndex, item: &mut ParsedItem) {
+    let lines: Vec<&str> = section.iter().map(|l| l.trim()).collect();
+    let mut context: Option<(ModType, Option<Slot>)> = None;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
+        if let Some(info) = ModType::from_info_line(line) {
+            context = Some(info);
+            continue;
+        }
+        // Fully parenthesised lines are reminder/help text, not mods.
+        if line.starts_with('(') && line.ends_with(')') {
+            continue;
+        }
+        if parse_meta_value(line, item) || parse_meta_flag(line, item) {
+            continue;
+        }
+        let next = lines.get(index).copied();
+        match parse_mod_line(line, next, stats, context, item.category.as_deref()) {
+            Some((parsed, took_next)) => {
+                item.mods.push(parsed);
+                index += usize::from(took_next);
+            }
+            None => note_unresolved(line, item),
+        }
+    }
+}
+
+/// Resolve one mod line, retrying it joined with `next`: a handful of cluster
+/// jewel enchantments print as two lines that share one trade option (Trap and
+/// Mine damage, Axe and Sword damage, …). The bool reports whether `next` was
+/// consumed as part of the mod.
+fn parse_mod_line(
+    line: &str,
+    next: Option<&str>,
+    stats: &StatIndex,
+    context: Option<(ModType, Option<Slot>)>,
+    category: Option<&str>,
+) -> Option<(mods::ParsedMod, bool)> {
+    if let Some(parsed) = mods::parse_mod(line, stats, context, category) {
+        return Some((parsed, false));
+    }
+    let joined = format!("{line}\n{}", next?);
+    let parsed = mods::parse_mod(&joined, stats, context, category)?;
+    Some((parsed, true))
+}
+
+/// Note a line that matched no stat, unless it is prose or a `Label: value`
+/// requirement/section head. A colon cannot disqualify a line on its own —
+/// cluster jewel enchants read "Added Small Passive Skills grant: …" — so this
+/// only applies to lines that already failed to resolve.
+fn note_unresolved(line: &str, item: &mut ParsedItem) {
+    let is_label = line.contains(": ") || line.ends_with(':');
+    // Only surface lines that look like a rollable mod (a space and a digit),
+    // which skips unique flavour text and lone weapon-type headers.
+    let looks_rollable = line.contains(' ') && line.bytes().any(|b| b.is_ascii_digit());
+    if !is_label && looks_rollable {
+        item.unknown_mods.push(line.to_string());
+    }
 }
 
 /// Handle the `Item Level:` / `Quality:` / `Sockets:` meta lines.
@@ -246,13 +288,34 @@ fn averaged_ranges(value: &str) -> Option<f64> {
     let mut total = 0.0;
     let mut found = false;
     for range in value.split(',') {
-        let range = range.trim().split_whitespace().next()?;
+        let range = range.split_whitespace().next()?;
         let (lo, hi) = range.split_once('-')?;
         let (lo, hi): (f64, f64) = (lo.trim().parse().ok()?, hi.trim().parse().ok()?);
         total += (lo + hi) / 2.0;
         found = true;
     }
     found.then_some(total)
+}
+
+/// Find the base type inside a magic item's decorated name, e.g.
+/// "Medium Cluster Jewel of the Lost" -> "Medium Cluster Jewel". Returns the
+/// longest known base in the name so "Cluster Jewel" cannot win over the
+/// "Medium Cluster Jewel" that actually trades, or `None` if none matches.
+fn magic_base_type(name: &str, items: &ItemIndex) -> Option<String> {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let mut best: Option<String> = None;
+    for start in 0..words.len() {
+        for end in (start + 1)..=words.len() {
+            let candidate = words[start..end].join(" ");
+            if items.base_type(&candidate).is_none() {
+                continue;
+            }
+            if best.as_ref().is_none_or(|found| found.len() < candidate.len()) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
 }
 
 /// Resolve the item's trade category from its base type, when known.
@@ -542,6 +605,136 @@ Fractured Item
                 .iter()
                 .any(|m| m.mod_type == ModType::Fractured && m.slot == Some(Slot::Suffix))
         );
+    }
+
+    // A magic cluster jewel: the name plate carries the affixes, the enchant
+    // block reads "Label: value", and the enchant text is an option stat.
+    const CLUSTER_JEWEL: &str = r#"Item Class: Jewels
+Rarity: Magic
+Medium Cluster Jewel of the Lost
+--------
+Requirements:
+Level: 54
+Int: 41
+--------
+Item Level: 84
+--------
+Adds 6 Passive Skills (enchant)
+1 Added Passive Skill is a Jewel Socket (enchant)
+Added Small Passive Skills grant: Minions have 12% increased maximum Life (enchant)
+--------
+Added Small Passive Skills also grant: +3% to Chaos Resistance
+--------
+Place into an allocated Medium or Large Jewel Socket on the Passive Skill Tree. Added passives do not interact with jewel radiuses. Right click to remove from the Socket.
+"#;
+
+    #[test]
+    fn magic_name_plate_resolves_the_tradeable_base_type() {
+        let stats = load_stats();
+        let items = load_items();
+        let item = parse_item(CLUSTER_JEWEL, Game::Poe1, &stats, &items).unwrap();
+
+        // "Medium Cluster Jewel of the Lost" is not a base type; the search
+        // needs the longest base inside it, not the whole decorated name.
+        assert_eq!(item.rarity, Some(Rarity::Magic));
+        assert_eq!(item.base_type, "Medium Cluster Jewel");
+        assert_eq!(item.category.as_deref(), Some("Cluster Jewel"));
+    }
+
+    #[test]
+    fn cluster_jewel_enchant_resolves_to_a_trade_option() {
+        let stats = load_stats();
+        let items = load_items();
+        let item = parse_item(CLUSTER_JEWEL, Game::Poe1, &stats, &items).unwrap();
+
+        // The colon in "Added Small Passive Skills grant: …" must not get the
+        // line skipped as a requirement/label line.
+        let granted = item
+            .mods
+            .iter()
+            .find(|m| m.stat_ref == "Added Small Passive Skills grant: #")
+            .expect("the small-passive enchant resolves");
+        assert_eq!(granted.mod_type, ModType::Enchant);
+        assert_eq!(granted.trade_ids, vec!["enchant.stat_3948993189".to_string()]);
+        // Minions have 12% increased maximum Life is option 30, not a roll.
+        assert_eq!(granted.option, Some(30));
+        assert!(granted.rolls.is_empty());
+
+        // The suffix's "also grant" explicit is a normal rolled stat.
+        let also = item
+            .mods
+            .iter()
+            .find(|m| m.stat_ref == "Added Small Passive Skills also grant: +#% to Chaos Resistance")
+            .expect("the also-grant explicit resolves");
+        assert_eq!(also.mod_type, ModType::Explicit);
+        assert_eq!(also.roll(), Some(3.0));
+        assert_eq!(also.option, None);
+
+        assert!(item.unknown_mods.is_empty(), "unresolved: {:?}", item.unknown_mods);
+    }
+
+    #[test]
+    fn added_passive_count_is_flagged_lower_is_better() {
+        let stats = load_stats();
+        let items = load_items();
+        let item = parse_item(CLUSTER_JEWEL, Game::Poe1, &stats, &items).unwrap();
+
+        let passives = item
+            .mods
+            .iter()
+            .find(|m| m.stat_ref == "Adds # Passive Skills")
+            .expect("the passive count resolves");
+        assert_eq!(passives.roll(), Some(6.0));
+        assert!(passives.lower_is_better, "fewer added passives is better");
+
+        // The jewel socket count is an ordinary higher-is-better stat.
+        let socket = item
+            .mods
+            .iter()
+            .find(|m| m.stat_ref == "# Added Passive Skills are Jewel Sockets")
+            .expect("the jewel socket count resolves");
+        assert_eq!(socket.roll(), Some(1.0));
+        assert!(!socket.lower_is_better);
+    }
+
+    #[test]
+    fn two_line_cluster_enchant_folds_into_one_option() {
+        // The trap/mine enchant prints as two lines sharing a single option.
+        const TRAP_MINE: &str = r#"Item Class: Jewels
+Rarity: Magic
+Large Cluster Jewel of the Lost
+--------
+Item Level: 84
+--------
+{ Enchant Modifier }
+Adds 8 Passive Skills
+Added Small Passive Skills grant: 12% increased Trap Damage
+Added Small Passive Skills grant: 12% increased Mine Damage
+"#;
+        let stats = load_stats();
+        let items = load_items();
+        let item = parse_item(TRAP_MINE, Game::Poe1, &stats, &items).unwrap();
+
+        let granted: Vec<&mods::ParsedMod> = item
+            .mods
+            .iter()
+            .filter(|m| m.stat_ref == "Added Small Passive Skills grant: #")
+            .collect();
+        assert_eq!(granted.len(), 1, "the two printed lines are one mod");
+        assert_eq!(granted[0].option, Some(33));
+        assert!(item.unknown_mods.is_empty(), "unresolved: {:?}", item.unknown_mods);
+    }
+
+    #[test]
+    fn requirement_lines_are_still_skipped() {
+        let stats = load_stats();
+        let items = load_items();
+        let item = parse_item(CLUSTER_JEWEL, Game::Poe1, &stats, &items).unwrap();
+
+        // "Level: 54" / "Int: 41" resolve to nothing and must not be surfaced.
+        assert!(!item.mods.iter().any(|m| m.text.starts_with("Level:")));
+        assert!(!item.mods.iter().any(|m| m.text.starts_with("Int:")));
+        assert_eq!(item.item_level, Some(84));
     }
 
     #[test]
