@@ -261,11 +261,19 @@ pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
                 enabled: enabled && m.mod_type != crate::item::mods::ModType::Crafted,
                 as_explicit: false,
                 use_pseudo: !m.pseudo_ids.is_empty(),
-                min: roll.filter(|_| !m.lower_is_better).map(f64::floor),
-                max: roll.filter(|_| m.lower_is_better).map(f64::ceil),
+                min: roll.filter(|_| !m.lower_is_better).map(|r| round_outward(r, f64::floor)),
+                max: roll.filter(|_| m.lower_is_better).map(|r| round_outward(r, f64::ceil)),
             }
         })
         .collect()
+}
+
+/// Round a roll away from the item so the item itself still matches its own
+/// filter — down for a floor, up for a cap. Rounding to a tenth rather than a
+/// whole number keeps fractional stats meaningful: flooring a 0.1% Life
+/// Regeneration roll to 0 would drop the roll from the search entirely.
+fn round_outward(roll: f64, direction: fn(f64) -> f64) -> f64 {
+    direction(roll * 10.0) / 10.0
 }
 
 /// One trade stat filter for a resolved mod, or `None` if it has no trade id.
@@ -731,6 +739,23 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
         let sockets = by_id("enchant.stat_4079888060");
         assert_eq!(sockets["value"]["min"], 1.0);
         assert!(sockets["value"].get("max").is_none());
+    }
+
+    #[test]
+    fn fractional_rolls_keep_a_tenth_of_precision() {
+        let item = ParsedItem {
+            base_type: "Large Cluster Jewel".to_string(),
+            rarity: Some(Rarity::Magic),
+            mods: vec![mod_with(
+                "Added Small Passive Skills also grant: Regenerate #% of Life per Second",
+                "explicit.stat_3721672021",
+                Some(0.1),
+            )],
+            ..Default::default()
+        };
+        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+        // Flooring to a whole number would drop this roll out of the search.
+        assert_eq!(body["query"]["stats"][0]["filters"][0]["value"]["min"], 0.1);
     }
 
     #[test]
