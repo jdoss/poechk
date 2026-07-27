@@ -212,6 +212,15 @@ fn strip_metadata(line: &str) -> &str {
     line.split('\u{2014}').next().unwrap_or(line).trim()
 }
 
+/// The stat text of a printed line, with its ` (implicit)`/… type marker and
+/// any ` — <metadata>` tail removed. Callers that join two printed lines into
+/// one mod need this: only the final line's marker is stripped by [`parse_mod`],
+/// so an inner line would otherwise carry its marker into the match.
+pub fn line_body(line: &str) -> &str {
+    let (_, rest) = ModType::from_suffix(line.trim());
+    strip_metadata(rest)
+}
+
 /// Resolve a printed mod line to a [`ParsedMod`], or `None` if unknown.
 ///
 /// `context` is the (type, slot) from a preceding advanced `{ … }` info line,

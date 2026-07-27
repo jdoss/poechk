@@ -178,7 +178,9 @@ fn parse_mod_line(
     if let Some(parsed) = mods::parse_mod(line, stats, context, category) {
         return Some((parsed, false));
     }
-    let joined = format!("{line}\n{}", next?);
+    // Only the trailing line's ` (enchant)` marker is stripped downstream, so
+    // the leading line has to be reduced to its stat text before joining.
+    let joined = format!("{}\n{}", mods::line_body(line), next?);
     let parsed = mods::parse_mod(&joined, stats, context, category)?;
     Some((parsed, true))
 }
@@ -639,6 +641,18 @@ Place into an allocated Medium or Large Jewel Socket on the Passive Skill Tree. 
         assert_eq!(item.rarity, Some(Rarity::Magic));
         assert_eq!(item.base_type, "Medium Cluster Jewel");
         assert_eq!(item.category.as_deref(), Some("Cluster Jewel"));
+
+        // The prefix can be a word that reads like part of a base ("Notable"),
+        // and the longest match must still win over any shorter one.
+        for (plate, expected) in [
+            ("Notable Large Cluster Jewel of the Crystal", "Large Cluster Jewel"),
+            ("Healthy Large Cluster Jewel of the Newt", "Large Cluster Jewel"),
+            ("Small Cluster Jewel", "Small Cluster Jewel"),
+        ] {
+            let text = format!("Item Class: Jewels\nRarity: Magic\n{plate}\n--------\nItem Level: 81\n");
+            let parsed = parse_item(&text, Game::Poe1, &stats, &items).unwrap();
+            assert_eq!(parsed.base_type, expected, "for plate {plate:?}");
+        }
     }
 
     #[test]
@@ -722,6 +736,50 @@ Added Small Passive Skills grant: 12% increased Mine Damage
             .collect();
         assert_eq!(granted.len(), 1, "the two printed lines are one mod");
         assert_eq!(granted[0].option, Some(33));
+        assert!(item.unknown_mods.is_empty(), "unresolved: {:?}", item.unknown_mods);
+    }
+
+    #[test]
+    fn two_line_enchant_folds_when_each_line_is_suffix_typed() {
+        // The standard Ctrl+C format repeats " (enchant)" on both halves of a
+        // two-line enchant; the leading half's marker must not reach the match.
+        const BROOD_SLIVER: &str = r#"Item Class: Jewels
+Rarity: Rare
+Brood Sliver
+Large Cluster Jewel
+--------
+Item Level: 80
+--------
+Adds 8 Passive Skills (enchant)
+(All Added Passive Skills are Small unless otherwise specified) (enchant)
+2 Added Passive Skills are Jewel Sockets (enchant)
+Added Small Passive Skills grant: Axe Attacks deal 12% increased Damage with Hits and Ailments (enchant)
+Added Small Passive Skills grant: Sword Attacks deal 12% increased Damage with Hits and Ailments (enchant)
+--------
+{ Prefix Modifier "Notable" (Tier: 1) — Damage, Physical, Attack }
+1 Added Passive Skill is Wound Aggravation
+{ Suffix Modifier "of the Brute" (Tier: 3) — Attribute }
+Added Small Passive Skills also grant: +3(2-3) to Strength
+"#;
+        let stats = load_stats();
+        let items = load_items();
+        let item = parse_item(BROOD_SLIVER, Game::Poe1, &stats, &items).unwrap();
+
+        let granted: Vec<&mods::ParsedMod> = item
+            .mods
+            .iter()
+            .filter(|m| m.stat_ref == "Added Small Passive Skills grant: #")
+            .collect();
+        assert_eq!(granted.len(), 1, "the Axe/Sword pair is one mod");
+        assert_eq!(granted[0].mod_type, ModType::Enchant);
+        assert_eq!(granted[0].option, Some(1));
+
+        // A cluster jewel's notables drive its price, so they must resolve.
+        assert!(
+            item.mods
+                .iter()
+                .any(|m| m.stat_ref == "1 Added Passive Skill is Wound Aggravation")
+        );
         assert!(item.unknown_mods.is_empty(), "unresolved: {:?}", item.unknown_mods);
     }
 
