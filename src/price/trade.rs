@@ -8,7 +8,6 @@
 //! responses.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,7 +15,7 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::item::{ParsedItem, Rarity};
 use crate::price::PriceQuote;
-use crate::price::ratelimit::RateLimiter;
+use crate::price::ratelimit::{Bucket, RateLimiter};
 
 const USER_AGENT: &str = concat!(
     "poechk/",
@@ -384,12 +383,15 @@ pub struct Account {
     pub name: String,
 }
 
-/// Derive the safe minimum interval between requests from GGG's rate-limit
-/// headers: for each advertised `max:window` bucket, `window / max`, taking the
-/// most restrictive and adding a latency margin.
-fn interval_from_headers(headers: &ureq::http::HeaderMap, margin: f64) -> Option<Duration> {
-    let rules = headers.get("x-rate-limit-rules")?.to_str().ok()?;
-    let mut interval = 0.0_f64;
+/// The sliding-window limits a response advertises, read from the
+/// `x-rate-limit-<rule>` headers. Each is a `max:window:penalty` triple —
+/// "5:10:60,15:60:300" means at most 5 requests per 10s and 15 per 60s. The
+/// penalty is what GGG imposes on a violation, not a limit, so it is ignored.
+fn buckets_from_headers(headers: &ureq::http::HeaderMap) -> Vec<Bucket> {
+    let Some(rules) = headers.get("x-rate-limit-rules").and_then(|v| v.to_str().ok()) else {
+        return Vec::new();
+    };
+    let mut buckets = Vec::new();
     for rule in rules.split(',') {
         let key = format!("x-rate-limit-{}", rule.trim().to_ascii_lowercase());
         let Some(spec) = headers.get(&key).and_then(|v| v.to_str().ok()) else {
@@ -398,14 +400,15 @@ fn interval_from_headers(headers: &ureq::http::HeaderMap, margin: f64) -> Option
         for bucket in spec.split(',') {
             let mut parts = bucket.split(':');
             if let (Some(max), Some(window)) = (parts.next(), parts.next())
-                && let (Ok(max), Ok(window)) = (max.parse::<f64>(), window.parse::<f64>())
-                && max > 0.0
+                && let (Ok(max), Ok(window)) = (max.trim().parse::<u32>(), window.trim().parse::<f64>())
+                && max > 0
+                && window > 0.0
             {
-                interval = interval.max(window / max);
+                buckets.push(Bucket { max, window });
             }
         }
     }
-    (interval > 0.0).then(|| Duration::from_secs_f64(interval + margin))
+    buckets
 }
 
 /// Prices items against the official trade search + fetch endpoints.
@@ -439,7 +442,7 @@ impl TradeSource {
         let body = build_search_body(item, filters, misc);
         let limiter = RateLimiter::open()?;
 
-        limiter.wait("search");
+        limiter.wait("search", self.latency_margin);
         let search = self.search(&body, &limiter)?;
         let url = search_url(&self.league, &search.id);
         if search.result.is_empty() {
@@ -452,7 +455,7 @@ impl TradeSource {
         }
         let ids: Vec<String> = search.result.iter().take(FETCH_LIMIT).cloned().collect();
 
-        limiter.wait("fetch");
+        limiter.wait("fetch", self.latency_margin);
         let listings = self.fetch(&ids, &search.id, &limiter)?;
 
         let quotes = listings
@@ -493,9 +496,7 @@ impl TradeSource {
             .build()
             .send_json(body)
             .map_err(|e| anyhow::anyhow!("trade search request failed: {e}"))?;
-        if let Some(interval) = interval_from_headers(resp.headers(), self.latency_margin) {
-            limiter.record("search", interval);
-        }
+        limiter.record("search", &buckets_from_headers(resp.headers()));
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             anyhow::bail!(
@@ -532,9 +533,7 @@ impl TradeSource {
             .build()
             .call()
             .map_err(|e| anyhow::anyhow!("trade fetch request failed: {e}"))?;
-        if let Some(interval) = interval_from_headers(resp.headers(), self.latency_margin) {
-            limiter.record("fetch", interval);
-        }
+        limiter.record("fetch", &buckets_from_headers(resp.headers()));
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             anyhow::bail!(
@@ -832,6 +831,42 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
         // Neither bound set leaves the group off entirely.
         let neither = build_search_body(&item, &[], &MiscFilters::default());
         assert!(neither["query"].get("filters").is_none());
+    }
+
+    #[test]
+    fn rate_limit_headers_parse_into_sliding_windows() {
+        use ureq::http::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rate-limit-rules", HeaderValue::from_static("Ip"));
+        // The live trade-search policy, verbatim.
+        headers.insert(
+            "x-rate-limit-ip",
+            HeaderValue::from_static("5:10:60,15:60:300,30:300:1800,600:21600:3600"),
+        );
+
+        // The third field is GGG's penalty for a violation, not a limit.
+        assert_eq!(
+            buckets_from_headers(&headers),
+            vec![
+                Bucket { max: 5, window: 10.0 },
+                Bucket { max: 15, window: 60.0 },
+                Bucket { max: 30, window: 300.0 },
+                Bucket { max: 600, window: 21600.0 },
+            ]
+        );
+
+        // A response with no rate-limit headers imposes no limits.
+        assert!(buckets_from_headers(&HeaderMap::new()).is_empty());
+
+        // A rule with no matching header is skipped rather than panicking.
+        let mut partial = HeaderMap::new();
+        partial.insert("x-rate-limit-rules", HeaderValue::from_static("Ip,Account"));
+        partial.insert("x-rate-limit-ip", HeaderValue::from_static("5:10:60"));
+        assert_eq!(
+            buckets_from_headers(&partial),
+            vec![Bucket { max: 5, window: 10.0 }]
+        );
     }
 
     #[test]
