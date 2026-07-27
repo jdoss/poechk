@@ -116,12 +116,12 @@ pub struct PriceResult {
 }
 
 pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscFilters) -> Value {
-    let stat_filters: Vec<Value> = item
-        .mods
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| filters.get(i).and_then(|spec| stat_filter(m, spec)))
-        .collect();
+    let stat_filters = merge_by_id(
+        item.mods
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| filters.get(i).and_then(|spec| stat_filter(m, spec))),
+    );
 
     // "any" (not "online") for valuation: fairly-priced sellers are often
     // offline, so online-only skews high. (Online/any toggle: later.)
@@ -141,6 +141,46 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
     }
 
     json!({ "query": query, "sort": { "price": "asc" } })
+}
+
+/// Collapse filters that target the same trade stat id into one.
+///
+/// Several rows can resolve to a single id — a mod searched as its per-stat
+/// pseudo total lands on the same `pseudo.pseudo_total_life` as the folded
+/// total-life row. Sending both leaves the trade site quietly applying the
+/// tighter bound while the looser row looks like it is doing something, so keep
+/// the narrowest bound and drop the duplicate. An enabled row wins over a
+/// disabled one, since disabled carries no bound at all.
+fn merge_by_id(filters: impl Iterator<Item = Value>) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::new();
+    for filter in filters {
+        let Some(existing) = merged.iter_mut().find(|f| f["id"] == filter["id"]) else {
+            merged.push(filter);
+            continue;
+        };
+        if filter["disabled"] == Value::Bool(false) {
+            existing["disabled"] = Value::Bool(false);
+        }
+        narrow(existing, &filter, "min", f64::max);
+        narrow(existing, &filter, "max", f64::min);
+    }
+    merged
+}
+
+/// Tighten `target`'s `key` bound towards `other`'s using `pick`, taking
+/// `other`'s outright when `target` has no bound of that kind.
+fn narrow(target: &mut Value, other: &Value, key: &str, pick: fn(f64, f64) -> f64) {
+    let Some(incoming) = other["value"].get(key).and_then(Value::as_f64) else {
+        return;
+    };
+    let tightened = match target["value"].get(key).and_then(Value::as_f64) {
+        Some(current) => pick(current, incoming),
+        None => incoming,
+    };
+    if !target["value"].is_object() {
+        target["value"] = json!({});
+    }
+    target["value"][key] = json!(tightened);
 }
 
 /// A `{"min": …, "max": …}` bound, or `None` when neither end is set.
@@ -831,6 +871,77 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
         // Neither bound set leaves the group off entirely.
         let neither = build_search_body(&item, &[], &MiscFilters::default());
         assert!(neither["query"].get("filters").is_none());
+    }
+
+    #[test]
+    fn rows_sharing_a_stat_id_collapse_to_the_narrowest_bound() {
+        // A ring whose flat life is searched as its pseudo total, alongside the
+        // folded total-life row: both land on pseudo.pseudo_total_life.
+        let mut flat = mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(105.0));
+        flat.pseudo_ids = vec!["pseudo.pseudo_total_life".to_string()];
+        let mut folded = mod_with("+# total maximum Life", "pseudo.pseudo_total_life", Some(125.0));
+        folded.mod_type = ModType::Pseudo;
+        let item = ParsedItem {
+            base_type: "Opal Ring".to_string(),
+            rarity: Some(Rarity::Rare),
+            mods: vec![flat, folded],
+            ..Default::default()
+        };
+
+        let both_on = FilterSpec {
+            enabled: true,
+            use_pseudo: true,
+            ..Default::default()
+        };
+        let body = build_search_body(
+            &item,
+            &[
+                FilterSpec { min: Some(105.0), ..both_on },
+                FilterSpec { min: Some(125.0), ..both_on },
+            ],
+            &MiscFilters::default(),
+        );
+
+        let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
+        assert_eq!(filters.len(), 1, "one id, one filter: {filters:?}");
+        assert_eq!(filters[0]["id"], "pseudo.pseudo_total_life");
+        // The trade site would apply 125 anyway; say so instead of sending both.
+        assert_eq!(filters[0]["value"]["min"], 125.0);
+        assert_eq!(filters[0]["disabled"], false);
+    }
+
+    #[test]
+    fn merging_keeps_a_disabled_row_from_masking_an_enabled_one() {
+        let mut flat = mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(105.0));
+        flat.pseudo_ids = vec!["pseudo.pseudo_total_life".to_string()];
+        let mut folded = mod_with("+# total maximum Life", "pseudo.pseudo_total_life", Some(125.0));
+        folded.mod_type = ModType::Pseudo;
+        let item = ParsedItem {
+            base_type: "Opal Ring".to_string(),
+            rarity: Some(Rarity::Rare),
+            mods: vec![flat, folded],
+            ..Default::default()
+        };
+
+        // The subsumed flat row comes first and is off; the fold is on.
+        let body = build_search_body(
+            &item,
+            &[
+                FilterSpec { enabled: false, use_pseudo: true, ..Default::default() },
+                FilterSpec {
+                    enabled: true,
+                    use_pseudo: true,
+                    min: Some(125.0),
+                    ..Default::default()
+                },
+            ],
+            &MiscFilters::default(),
+        );
+
+        let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0]["disabled"], false);
+        assert_eq!(filters[0]["value"]["min"], 125.0);
     }
 
     #[test]
