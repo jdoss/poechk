@@ -125,6 +125,9 @@ struct Overlay {
     /// Minimum sockets / links filters, as editable text ("" = no filter).
     sockets_min: String,
     links_min: String,
+    /// Item level bounds, as editable text ("" = no filter).
+    ilvl_min: String,
+    ilvl_max: String,
     /// Minimum DPS filters (weapons), as editable text ("" = no filter).
     dps_min: String,
     pdps_min: String,
@@ -145,6 +148,8 @@ enum Message {
     SetMax(usize, String),
     SetSocketsMin(String),
     SetLinksMin(String),
+    SetIlvlMin(String),
+    SetIlvlMax(String),
     SetDpsMin(String),
     SetPdpsMin(String),
     SetEdpsMin(String),
@@ -156,6 +161,30 @@ enum Message {
     OpenBrowser,
     Searched(SearchOutcome),
     Dismiss,
+}
+
+impl Message {
+    /// Whether this message changes what the next search would ask for.
+    fn edits_filters(&self) -> bool {
+        matches!(
+            self,
+            Message::SetEnabled(..)
+                | Message::ToggleModType(_)
+                | Message::TogglePseudo(_)
+                | Message::SetMin(..)
+                | Message::SetMax(..)
+                | Message::SetSocketsMin(_)
+                | Message::SetLinksMin(_)
+                | Message::SetIlvlMin(_)
+                | Message::SetIlvlMax(_)
+                | Message::SetDpsMin(_)
+                | Message::SetPdpsMin(_)
+                | Message::SetEdpsMin(_)
+                | Message::SetLeague(_)
+                | Message::CycleStatus
+                | Message::CycleCorrupted
+        )
+    }
 }
 
 impl Overlay {
@@ -219,6 +248,10 @@ impl Overlay {
             .map(|n| n.to_string())
             .unwrap_or_default();
 
+        // Item level gates which mod tiers an item can roll, so it prices every
+        // item class; seed the floor from the item and let it be edited.
+        let ilvl_min = item.item_level.map(|n| n.to_string()).unwrap_or_default();
+
         // Prefill the dominant DPS kind (floored) — pDPS for physical
         // weapons, eDPS for elemental — leaving the others unfiltered.
         let phys_dominant = item.phys_damage.unwrap_or(0.0) >= item.ele_damage.unwrap_or(0.0);
@@ -243,6 +276,8 @@ impl Overlay {
             rows,
             sockets_min,
             links_min,
+            ilvl_min,
+            ilvl_max: String::new(),
             dps_min: String::new(),
             pdps_min,
             edps_min,
@@ -255,6 +290,13 @@ impl Overlay {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Any filter edit invalidates the last search: its results priced a
+        // different query, and its URL would open that query in the browser
+        // rather than what the card now shows.
+        if message.edits_filters() {
+            self.trade_url = None;
+            self.search = SearchState::Idle;
+        }
         match message {
             Message::SetEnabled(i, on) => {
                 if let Some(row) = self.rows.get_mut(i) {
@@ -292,6 +334,14 @@ impl Overlay {
             }
             Message::CycleStatus => {
                 self.status = self.status.next();
+                Task::none()
+            }
+            Message::SetIlvlMin(value) => {
+                self.ilvl_min = value;
+                Task::none()
+            }
+            Message::SetIlvlMax(value) => {
+                self.ilvl_max = value;
                 Task::none()
             }
             Message::Search => {
@@ -384,6 +434,8 @@ impl Overlay {
             corrupted: self.corrupted.option(),
             sockets_min: self.sockets_min.trim().parse().ok(),
             links_min: self.links_min.trim().parse().ok(),
+            ilvl_min: self.ilvl_min.trim().parse().ok(),
+            ilvl_max: self.ilvl_max.trim().parse().ok(),
             dps_min: self.dps_min.trim().parse().ok(),
             pdps_min: self.pdps_min.trim().parse().ok(),
             edps_min: self.edps_min.trim().parse().ok(),
@@ -457,6 +509,30 @@ impl Overlay {
                             .size(12.0)
                             .padding(4)
                             .width(Length::Fixed(56.0)),
+                    ),
+            );
+        }
+
+        if !bulk && item.item_level.is_some() {
+            col = col.push(
+                Row::new()
+                    .spacing(6)
+                    .align_y(Vertical::Center)
+                    .push(text("Item Level ≥").size(12.0))
+                    .push(
+                        text_input("any", &self.ilvl_min)
+                            .on_input(Message::SetIlvlMin)
+                            .size(12.0)
+                            .padding(4)
+                            .width(Length::Fixed(44.0)),
+                    )
+                    .push(text("≤").size(12.0))
+                    .push(
+                        text_input("any", &self.ilvl_max)
+                            .on_input(Message::SetIlvlMax)
+                            .size(12.0)
+                            .padding(4)
+                            .width(Length::Fixed(44.0)),
                     ),
             );
         }
@@ -598,6 +674,9 @@ fn estimated_height(item: &ParsedItem) -> u32 {
     let mut height: u32 = 165;
     if item.total_dps().is_some() {
         height += 58; // DPS readout + filter row
+    }
+    if item.item_level.is_some() {
+        height += 32; // item level row
     }
     if item.sockets.is_some() {
         height += 32; // sockets/links row
@@ -864,5 +943,49 @@ fn detect_cosmic_theme() -> iced::Theme {
     match cosmic::cosmic_theme::ThemeMode::is_dark(&mode_config) {
         Ok(false) => iced::Theme::Light,
         Ok(true) | Err(_) => iced::Theme::Dark,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_filter_edit_invalidates_the_last_search() {
+        // Changing a filter and pressing "Open in browser" must not reopen the
+        // previous query — the reported symptom was toggling Instant Buyout and
+        // getting the pre-toggle search in the browser.
+        let edits = [
+            Message::CycleStatus,
+            Message::CycleCorrupted,
+            Message::SetEnabled(0, false),
+            Message::ToggleModType(0),
+            Message::TogglePseudo(0),
+            Message::SetMin(0, "5".into()),
+            Message::SetMax(0, "9".into()),
+            Message::SetSocketsMin("6".into()),
+            Message::SetLinksMin("6".into()),
+            Message::SetIlvlMin("84".into()),
+            Message::SetIlvlMax("86".into()),
+            Message::SetDpsMin("400".into()),
+            Message::SetPdpsMin("100".into()),
+            Message::SetEdpsMin("300".into()),
+            Message::SetLeague("Standard".into()),
+        ];
+        for message in edits {
+            assert!(message.edits_filters(), "{message:?} must invalidate");
+        }
+
+        // Messages that don't change the query must leave the results standing.
+        let keeps = [
+            Message::Search,
+            Message::OpenBrowser,
+            Message::Dismiss,
+            Message::LeaguesLoaded(vec!["Standard".into()]),
+            Message::Searched(Err("boom".into())),
+        ];
+        for message in keeps {
+            assert!(!message.edits_filters(), "{message:?} must not invalidate");
+        }
     }
 }

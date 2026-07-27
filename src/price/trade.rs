@@ -87,6 +87,10 @@ pub struct MiscFilters {
     pub status: Status,
     /// None = any; Some(true) = corrupted only; Some(false) = uncorrupted only.
     pub corrupted: Option<bool>,
+    /// Minimum item level.
+    pub ilvl_min: Option<u32>,
+    /// Maximum item level.
+    pub ilvl_max: Option<u32>,
     /// Minimum total socket count.
     pub sockets_min: Option<u8>,
     /// Minimum size of the largest linked group.
@@ -133,48 +137,77 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
     {
         query["name"] = json!(name);
     }
-    let mut filter_groups = serde_json::Map::new();
+    if let Some(groups) = item_filter_groups(misc) {
+        query["filters"] = groups;
+    }
+
+    json!({ "query": query, "sort": { "price": "asc" } })
+}
+
+/// A `{"min": …, "max": …}` bound, or `None` when neither end is set.
+fn bound(min: Option<impl Into<Value>>, max: Option<impl Into<Value>>) -> Option<Value> {
+    let mut range = serde_json::Map::new();
+    if let Some(min) = min {
+        range.insert("min".to_string(), min.into());
+    }
+    if let Some(max) = max {
+        range.insert("max".to_string(), max.into());
+    }
+    (!range.is_empty()).then(|| Value::Object(range))
+}
+
+/// The `query.filters` groups for the non-affix filters, or `None` when none of
+/// them are set.
+fn item_filter_groups(misc: &MiscFilters) -> Option<Value> {
+    let mut groups = serde_json::Map::new();
+
+    let mut misc_filters = serde_json::Map::new();
     if let Some(corrupted) = misc.corrupted {
         let option = if corrupted { "true" } else { "false" };
-        filter_groups.insert(
+        misc_filters.insert("corrupted".to_string(), json!({ "option": option }));
+    }
+    if let Some(ilvl) = bound(misc.ilvl_min, misc.ilvl_max) {
+        misc_filters.insert("ilvl".to_string(), ilvl);
+    }
+    if !misc_filters.is_empty() {
+        groups.insert(
             "misc_filters".to_string(),
-            json!({ "filters": { "corrupted": { "option": option } } }),
+            json!({ "filters": Value::Object(misc_filters) }),
         );
     }
-    if misc.sockets_min.is_some() || misc.links_min.is_some() {
-        let mut socket_filters = serde_json::Map::new();
-        if let Some(sockets) = misc.sockets_min {
-            socket_filters.insert("sockets".to_string(), json!({ "min": sockets }));
-        }
-        if let Some(links) = misc.links_min {
-            socket_filters.insert("links".to_string(), json!({ "min": links }));
-        }
-        filter_groups.insert(
+
+    let mut socket_filters = serde_json::Map::new();
+    if let Some(sockets) = bound(misc.sockets_min, None::<u8>) {
+        socket_filters.insert("sockets".to_string(), sockets);
+    }
+    if let Some(links) = bound(misc.links_min, None::<u8>) {
+        socket_filters.insert("links".to_string(), links);
+    }
+    if !socket_filters.is_empty() {
+        groups.insert(
             "socket_filters".to_string(),
             json!({ "filters": Value::Object(socket_filters) }),
         );
     }
+
     let mut weapon_filters = serde_json::Map::new();
-    if let Some(dps) = misc.dps_min {
-        weapon_filters.insert("dps".to_string(), json!({ "min": dps }));
-    }
-    if let Some(pdps) = misc.pdps_min {
-        weapon_filters.insert("pdps".to_string(), json!({ "min": pdps }));
-    }
-    if let Some(edps) = misc.edps_min {
-        weapon_filters.insert("edps".to_string(), json!({ "min": edps }));
+    for (key, value) in [
+        ("dps", misc.dps_min),
+        ("pdps", misc.pdps_min),
+        ("edps", misc.edps_min),
+    ] {
+        if let Some(range) = bound(value, None::<f64>) {
+            weapon_filters.insert(key.to_string(), range);
+        }
     }
     if !weapon_filters.is_empty() {
-        filter_groups.insert(
+        groups.insert(
             "weapon_filters".to_string(),
             json!({ "filters": Value::Object(weapon_filters) }),
         );
     }
-    if !filter_groups.is_empty() {
-        query["filters"] = Value::Object(filter_groups);
-    }
 
-    json!({ "query": query, "sort": { "price": "asc" } })
+    (!groups.is_empty()).then(|| Value::Object(groups))
 }
 
 /// The pathofexile.com trade URL for a completed search, to open in a browser.
@@ -756,6 +789,49 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
         let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
         // Flooring to a whole number would drop this roll out of the search.
         assert_eq!(body["query"]["stats"][0]["filters"][0]["value"]["min"], 0.1);
+    }
+
+    #[test]
+    fn item_level_bounds_ride_along_with_the_other_misc_filters() {
+        let item = ParsedItem {
+            base_type: "Large Cluster Jewel".to_string(),
+            rarity: Some(Rarity::Magic),
+            ..Default::default()
+        };
+
+        let both = build_search_body(
+            &item,
+            &[],
+            &MiscFilters {
+                ilvl_min: Some(77),
+                ilvl_max: Some(84),
+                corrupted: Some(false),
+                ..Default::default()
+            },
+        );
+        let misc = &both["query"]["filters"]["misc_filters"]["filters"];
+        assert_eq!(misc["ilvl"]["min"], 77);
+        assert_eq!(misc["ilvl"]["max"], 84);
+        // Item level shares the misc_filters group with corrupted rather than
+        // replacing it.
+        assert_eq!(misc["corrupted"]["option"], "false");
+
+        // A floor alone must not imply a ceiling of zero.
+        let floor_only = build_search_body(
+            &item,
+            &[],
+            &MiscFilters {
+                ilvl_min: Some(77),
+                ..Default::default()
+            },
+        );
+        let ilvl = &floor_only["query"]["filters"]["misc_filters"]["filters"]["ilvl"];
+        assert_eq!(ilvl["min"], 77);
+        assert!(ilvl.get("max").is_none());
+
+        // Neither bound set leaves the group off entirely.
+        let neither = build_search_body(&item, &[], &MiscFilters::default());
+        assert!(neither["query"].get("filters").is_none());
     }
 
     #[test]
