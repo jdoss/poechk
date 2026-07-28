@@ -8,7 +8,6 @@
 //! responses.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,7 +15,7 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::item::{ParsedItem, Rarity};
 use crate::price::PriceQuote;
-use crate::price::ratelimit::RateLimiter;
+use crate::price::ratelimit::{Bucket, RateLimiter};
 
 const USER_AGENT: &str = concat!(
     "poechk/",
@@ -87,6 +86,10 @@ pub struct MiscFilters {
     pub status: Status,
     /// None = any; Some(true) = corrupted only; Some(false) = uncorrupted only.
     pub corrupted: Option<bool>,
+    /// Minimum item level.
+    pub ilvl_min: Option<u32>,
+    /// Maximum item level.
+    pub ilvl_max: Option<u32>,
     /// Minimum total socket count.
     pub sockets_min: Option<u8>,
     /// Minimum size of the largest linked group.
@@ -113,12 +116,12 @@ pub struct PriceResult {
 }
 
 pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscFilters) -> Value {
-    let stat_filters: Vec<Value> = item
-        .mods
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| filters.get(i).and_then(|spec| stat_filter(m, spec)))
-        .collect();
+    let stat_filters = merge_by_id(
+        item.mods
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| filters.get(i).and_then(|spec| stat_filter(m, spec))),
+    );
 
     // "any" (not "online") for valuation: fairly-priced sellers are often
     // offline, so online-only skews high. (Online/any toggle: later.)
@@ -133,48 +136,117 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
     {
         query["name"] = json!(name);
     }
-    let mut filter_groups = serde_json::Map::new();
+    if let Some(groups) = item_filter_groups(misc) {
+        query["filters"] = groups;
+    }
+
+    json!({ "query": query, "sort": { "price": "asc" } })
+}
+
+/// Collapse filters that target the same trade stat id into one.
+///
+/// Several rows can resolve to a single id — a mod searched as its per-stat
+/// pseudo total lands on the same `pseudo.pseudo_total_life` as the folded
+/// total-life row. Sending both leaves the trade site quietly applying the
+/// tighter bound while the looser row looks like it is doing something, so keep
+/// the narrowest bound and drop the duplicate. An enabled row wins over a
+/// disabled one, since disabled carries no bound at all.
+fn merge_by_id(filters: impl Iterator<Item = Value>) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::new();
+    for filter in filters {
+        let Some(existing) = merged.iter_mut().find(|f| f["id"] == filter["id"]) else {
+            merged.push(filter);
+            continue;
+        };
+        if filter["disabled"] == Value::Bool(false) {
+            existing["disabled"] = Value::Bool(false);
+        }
+        narrow(existing, &filter, "min", f64::max);
+        narrow(existing, &filter, "max", f64::min);
+    }
+    merged
+}
+
+/// Tighten `target`'s `key` bound towards `other`'s using `pick`, taking
+/// `other`'s outright when `target` has no bound of that kind.
+fn narrow(target: &mut Value, other: &Value, key: &str, pick: fn(f64, f64) -> f64) {
+    let Some(incoming) = other["value"].get(key).and_then(Value::as_f64) else {
+        return;
+    };
+    let tightened = match target["value"].get(key).and_then(Value::as_f64) {
+        Some(current) => pick(current, incoming),
+        None => incoming,
+    };
+    if !target["value"].is_object() {
+        target["value"] = json!({});
+    }
+    target["value"][key] = json!(tightened);
+}
+
+/// A `{"min": …, "max": …}` bound, or `None` when neither end is set.
+fn bound(min: Option<impl Into<Value>>, max: Option<impl Into<Value>>) -> Option<Value> {
+    let mut range = serde_json::Map::new();
+    if let Some(min) = min {
+        range.insert("min".to_string(), min.into());
+    }
+    if let Some(max) = max {
+        range.insert("max".to_string(), max.into());
+    }
+    (!range.is_empty()).then(|| Value::Object(range))
+}
+
+/// The `query.filters` groups for the non-affix filters, or `None` when none of
+/// them are set.
+fn item_filter_groups(misc: &MiscFilters) -> Option<Value> {
+    let mut groups = serde_json::Map::new();
+
+    let mut misc_filters = serde_json::Map::new();
     if let Some(corrupted) = misc.corrupted {
         let option = if corrupted { "true" } else { "false" };
-        filter_groups.insert(
+        misc_filters.insert("corrupted".to_string(), json!({ "option": option }));
+    }
+    if let Some(ilvl) = bound(misc.ilvl_min, misc.ilvl_max) {
+        misc_filters.insert("ilvl".to_string(), ilvl);
+    }
+    if !misc_filters.is_empty() {
+        groups.insert(
             "misc_filters".to_string(),
-            json!({ "filters": { "corrupted": { "option": option } } }),
+            json!({ "filters": Value::Object(misc_filters) }),
         );
     }
-    if misc.sockets_min.is_some() || misc.links_min.is_some() {
-        let mut socket_filters = serde_json::Map::new();
-        if let Some(sockets) = misc.sockets_min {
-            socket_filters.insert("sockets".to_string(), json!({ "min": sockets }));
-        }
-        if let Some(links) = misc.links_min {
-            socket_filters.insert("links".to_string(), json!({ "min": links }));
-        }
-        filter_groups.insert(
+
+    let mut socket_filters = serde_json::Map::new();
+    if let Some(sockets) = bound(misc.sockets_min, None::<u8>) {
+        socket_filters.insert("sockets".to_string(), sockets);
+    }
+    if let Some(links) = bound(misc.links_min, None::<u8>) {
+        socket_filters.insert("links".to_string(), links);
+    }
+    if !socket_filters.is_empty() {
+        groups.insert(
             "socket_filters".to_string(),
             json!({ "filters": Value::Object(socket_filters) }),
         );
     }
+
     let mut weapon_filters = serde_json::Map::new();
-    if let Some(dps) = misc.dps_min {
-        weapon_filters.insert("dps".to_string(), json!({ "min": dps }));
-    }
-    if let Some(pdps) = misc.pdps_min {
-        weapon_filters.insert("pdps".to_string(), json!({ "min": pdps }));
-    }
-    if let Some(edps) = misc.edps_min {
-        weapon_filters.insert("edps".to_string(), json!({ "min": edps }));
+    for (key, value) in [
+        ("dps", misc.dps_min),
+        ("pdps", misc.pdps_min),
+        ("edps", misc.edps_min),
+    ] {
+        if let Some(range) = bound(value, None::<f64>) {
+            weapon_filters.insert(key.to_string(), range);
+        }
     }
     if !weapon_filters.is_empty() {
-        filter_groups.insert(
+        groups.insert(
             "weapon_filters".to_string(),
             json!({ "filters": Value::Object(weapon_filters) }),
         );
     }
-    if !filter_groups.is_empty() {
-        query["filters"] = Value::Object(filter_groups);
-    }
 
-    json!({ "query": query, "sort": { "price": "asc" } })
+    (!groups.is_empty()).then(|| Value::Object(groups))
 }
 
 /// The pathofexile.com trade URL for a completed search, to open in a browser.
@@ -247,20 +319,33 @@ fn save_league_cache(ids: &[String]) {
 
 /// Default filters: a unique's affix rolls vary widely, so it is searched by
 /// name with affixes off; everything else filters on all resolved affixes at
-/// their current roll (min = roll, no max). Crafted mods start disabled — any
-/// buyer can re-craft them, so they shouldn't constrain the search.
+/// their current roll. The roll seeds the floor (min = roll) normally, and the
+/// cap (max = roll) for stats where less is better — a cluster jewel's added
+/// passive count, where 8/8 beats 9/8. Crafted mods start disabled: any buyer
+/// can re-craft them, so they shouldn't constrain the search.
 pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
     let enabled = item.rarity != Some(Rarity::Unique);
     item.mods
         .iter()
-        .map(|m| FilterSpec {
-            enabled: enabled && m.mod_type != crate::item::mods::ModType::Crafted,
-            as_explicit: false,
-            use_pseudo: !m.pseudo_ids.is_empty(),
-            min: m.roll().map(f64::floor),
-            max: None,
+        .map(|m| {
+            let roll = m.roll();
+            FilterSpec {
+                enabled: enabled && m.mod_type != crate::item::mods::ModType::Crafted,
+                as_explicit: false,
+                use_pseudo: !m.pseudo_ids.is_empty(),
+                min: roll.filter(|_| !m.lower_is_better).map(|r| round_outward(r, f64::floor)),
+                max: roll.filter(|_| m.lower_is_better).map(|r| round_outward(r, f64::ceil)),
+            }
         })
         .collect()
+}
+
+/// Round a roll away from the item so the item itself still matches its own
+/// filter — down for a floor, up for a cap. Rounding to a tenth rather than a
+/// whole number keeps fractional stats meaningful: flooring a 0.1% Life
+/// Regeneration roll to 0 would drop the roll from the search entirely.
+fn round_outward(roll: f64, direction: fn(f64) -> f64) -> f64 {
+    direction(roll * 10.0) / 10.0
 }
 
 /// One trade stat filter for a resolved mod, or `None` if it has no trade id.
@@ -274,17 +359,24 @@ fn stat_filter(m: &crate::item::mods::ParsedMod, spec: &FilterSpec) -> Option<Va
     };
     let id = ids.first()?;
     let mut filter = json!({ "id": id, "disabled": !spec.enabled });
-    if spec.enabled {
-        let mut value = serde_json::Map::new();
-        if let Some(min) = spec.min {
-            value.insert("min".to_string(), json!(min));
-        }
-        if let Some(max) = spec.max {
-            value.insert("max".to_string(), json!(max));
-        }
-        if !value.is_empty() {
-            filter["value"] = Value::Object(value);
-        }
+    if !spec.enabled {
+        return Some(filter);
+    }
+    // An option stat picks one entry from the trade site's list (which cluster
+    // jewel enchant, which allocated notable) — it has no range to bound.
+    if let Some(option) = m.option {
+        filter["value"] = json!({ "option": option });
+        return Some(filter);
+    }
+    let mut value = serde_json::Map::new();
+    if let Some(min) = spec.min {
+        value.insert("min".to_string(), json!(min));
+    }
+    if let Some(max) = spec.max {
+        value.insert("max".to_string(), json!(max));
+    }
+    if !value.is_empty() {
+        filter["value"] = Value::Object(value);
     }
     Some(filter)
 }
@@ -331,12 +423,15 @@ pub struct Account {
     pub name: String,
 }
 
-/// Derive the safe minimum interval between requests from GGG's rate-limit
-/// headers: for each advertised `max:window` bucket, `window / max`, taking the
-/// most restrictive and adding a latency margin.
-fn interval_from_headers(headers: &ureq::http::HeaderMap, margin: f64) -> Option<Duration> {
-    let rules = headers.get("x-rate-limit-rules")?.to_str().ok()?;
-    let mut interval = 0.0_f64;
+/// The sliding-window limits a response advertises, read from the
+/// `x-rate-limit-<rule>` headers. Each is a `max:window:penalty` triple —
+/// "5:10:60,15:60:300" means at most 5 requests per 10s and 15 per 60s. The
+/// penalty is what GGG imposes on a violation, not a limit, so it is ignored.
+fn buckets_from_headers(headers: &ureq::http::HeaderMap) -> Vec<Bucket> {
+    let Some(rules) = headers.get("x-rate-limit-rules").and_then(|v| v.to_str().ok()) else {
+        return Vec::new();
+    };
+    let mut buckets = Vec::new();
     for rule in rules.split(',') {
         let key = format!("x-rate-limit-{}", rule.trim().to_ascii_lowercase());
         let Some(spec) = headers.get(&key).and_then(|v| v.to_str().ok()) else {
@@ -345,14 +440,15 @@ fn interval_from_headers(headers: &ureq::http::HeaderMap, margin: f64) -> Option
         for bucket in spec.split(',') {
             let mut parts = bucket.split(':');
             if let (Some(max), Some(window)) = (parts.next(), parts.next())
-                && let (Ok(max), Ok(window)) = (max.parse::<f64>(), window.parse::<f64>())
-                && max > 0.0
+                && let (Ok(max), Ok(window)) = (max.trim().parse::<u32>(), window.trim().parse::<f64>())
+                && max > 0
+                && window > 0.0
             {
-                interval = interval.max(window / max);
+                buckets.push(Bucket { max, window });
             }
         }
     }
-    (interval > 0.0).then(|| Duration::from_secs_f64(interval + margin))
+    buckets
 }
 
 /// Prices items against the official trade search + fetch endpoints.
@@ -386,7 +482,7 @@ impl TradeSource {
         let body = build_search_body(item, filters, misc);
         let limiter = RateLimiter::open()?;
 
-        limiter.wait("search");
+        limiter.wait("search", self.latency_margin);
         let search = self.search(&body, &limiter)?;
         let url = search_url(&self.league, &search.id);
         if search.result.is_empty() {
@@ -399,7 +495,7 @@ impl TradeSource {
         }
         let ids: Vec<String> = search.result.iter().take(FETCH_LIMIT).cloned().collect();
 
-        limiter.wait("fetch");
+        limiter.wait("fetch", self.latency_margin);
         let listings = self.fetch(&ids, &search.id, &limiter)?;
 
         let quotes = listings
@@ -440,9 +536,7 @@ impl TradeSource {
             .build()
             .send_json(body)
             .map_err(|e| anyhow::anyhow!("trade search request failed: {e}"))?;
-        if let Some(interval) = interval_from_headers(resp.headers(), self.latency_margin) {
-            limiter.record("search", interval);
-        }
+        limiter.record("search", &buckets_from_headers(resp.headers()));
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             anyhow::bail!(
@@ -479,9 +573,7 @@ impl TradeSource {
             .build()
             .call()
             .map_err(|e| anyhow::anyhow!("trade fetch request failed: {e}"))?;
-        if let Some(interval) = interval_from_headers(resp.headers(), self.latency_margin) {
-            limiter.record("fetch", interval);
-        }
+        limiter.record("fetch", &buckets_from_headers(resp.headers()));
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             anyhow::bail!(
@@ -509,6 +601,8 @@ mod tests {
             slot: None,
             template: stat_ref.to_string(),
             rolls: roll.map(|r| vec![r]).unwrap_or_default(),
+            option: None,
+            lower_is_better: false,
             stat_ref: stat_ref.to_string(),
             trade_ids: vec![id.to_string()],
             explicit_ids: vec![id.to_string()],
@@ -673,6 +767,217 @@ mod tests {
         let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
         assert_eq!(filters[0]["disabled"], true);
         assert!(filters[0].get("value").is_none());
+    }
+
+    #[test]
+    fn cluster_jewel_searches_by_option_and_caps_the_passive_count() {
+        const CLUSTER_JEWEL: &str = r#"Item Class: Jewels
+Rarity: Magic
+Large Cluster Jewel of the Lost
+--------
+Item Level: 84
+--------
+Adds 8 Passive Skills (enchant)
+1 Added Passive Skill is a Jewel Socket (enchant)
+Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
+"#;
+        let stats = crate::data::load_stats();
+        let items = crate::data::load_items();
+        let item =
+            crate::item::parse::parse_item(CLUSTER_JEWEL, crate::item::Game::Poe1, &stats, &items)
+                .unwrap();
+        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+
+        assert_eq!(body["query"]["type"], "Large Cluster Jewel");
+        let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
+        let by_id = |id: &str| {
+            filters
+                .iter()
+                .find(|f| f["id"] == id)
+                .unwrap_or_else(|| panic!("no filter for {id}"))
+        };
+
+        // The enchant text picks a trade option, not a numeric range.
+        let granted = by_id("enchant.stat_3948993189");
+        assert_eq!(granted["value"]["option"], 17);
+        assert!(granted["value"].get("min").is_none());
+
+        // Fewer added passives is better, so 8 is the cap, not the floor.
+        let passives = by_id("enchant.stat_3086156145");
+        assert_eq!(passives["value"]["max"], 8.0);
+        assert!(passives["value"].get("min").is_none());
+
+        // More jewel sockets is better, so that one keeps its floor.
+        let sockets = by_id("enchant.stat_4079888060");
+        assert_eq!(sockets["value"]["min"], 1.0);
+        assert!(sockets["value"].get("max").is_none());
+    }
+
+    #[test]
+    fn fractional_rolls_keep_a_tenth_of_precision() {
+        let item = ParsedItem {
+            base_type: "Large Cluster Jewel".to_string(),
+            rarity: Some(Rarity::Magic),
+            mods: vec![mod_with(
+                "Added Small Passive Skills also grant: Regenerate #% of Life per Second",
+                "explicit.stat_3721672021",
+                Some(0.1),
+            )],
+            ..Default::default()
+        };
+        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+        // Flooring to a whole number would drop this roll out of the search.
+        assert_eq!(body["query"]["stats"][0]["filters"][0]["value"]["min"], 0.1);
+    }
+
+    #[test]
+    fn item_level_bounds_ride_along_with_the_other_misc_filters() {
+        let item = ParsedItem {
+            base_type: "Large Cluster Jewel".to_string(),
+            rarity: Some(Rarity::Magic),
+            ..Default::default()
+        };
+
+        let both = build_search_body(
+            &item,
+            &[],
+            &MiscFilters {
+                ilvl_min: Some(77),
+                ilvl_max: Some(84),
+                corrupted: Some(false),
+                ..Default::default()
+            },
+        );
+        let misc = &both["query"]["filters"]["misc_filters"]["filters"];
+        assert_eq!(misc["ilvl"]["min"], 77);
+        assert_eq!(misc["ilvl"]["max"], 84);
+        // Item level shares the misc_filters group with corrupted rather than
+        // replacing it.
+        assert_eq!(misc["corrupted"]["option"], "false");
+
+        // A floor alone must not imply a ceiling of zero.
+        let floor_only = build_search_body(
+            &item,
+            &[],
+            &MiscFilters {
+                ilvl_min: Some(77),
+                ..Default::default()
+            },
+        );
+        let ilvl = &floor_only["query"]["filters"]["misc_filters"]["filters"]["ilvl"];
+        assert_eq!(ilvl["min"], 77);
+        assert!(ilvl.get("max").is_none());
+
+        // Neither bound set leaves the group off entirely.
+        let neither = build_search_body(&item, &[], &MiscFilters::default());
+        assert!(neither["query"].get("filters").is_none());
+    }
+
+    #[test]
+    fn rows_sharing_a_stat_id_collapse_to_the_narrowest_bound() {
+        // A ring whose flat life is searched as its pseudo total, alongside the
+        // folded total-life row: both land on pseudo.pseudo_total_life.
+        let mut flat = mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(105.0));
+        flat.pseudo_ids = vec!["pseudo.pseudo_total_life".to_string()];
+        let mut folded = mod_with("+# total maximum Life", "pseudo.pseudo_total_life", Some(125.0));
+        folded.mod_type = ModType::Pseudo;
+        let item = ParsedItem {
+            base_type: "Opal Ring".to_string(),
+            rarity: Some(Rarity::Rare),
+            mods: vec![flat, folded],
+            ..Default::default()
+        };
+
+        let both_on = FilterSpec {
+            enabled: true,
+            use_pseudo: true,
+            ..Default::default()
+        };
+        let body = build_search_body(
+            &item,
+            &[
+                FilterSpec { min: Some(105.0), ..both_on },
+                FilterSpec { min: Some(125.0), ..both_on },
+            ],
+            &MiscFilters::default(),
+        );
+
+        let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
+        assert_eq!(filters.len(), 1, "one id, one filter: {filters:?}");
+        assert_eq!(filters[0]["id"], "pseudo.pseudo_total_life");
+        // The trade site would apply 125 anyway; say so instead of sending both.
+        assert_eq!(filters[0]["value"]["min"], 125.0);
+        assert_eq!(filters[0]["disabled"], false);
+    }
+
+    #[test]
+    fn merging_keeps_a_disabled_row_from_masking_an_enabled_one() {
+        let mut flat = mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(105.0));
+        flat.pseudo_ids = vec!["pseudo.pseudo_total_life".to_string()];
+        let mut folded = mod_with("+# total maximum Life", "pseudo.pseudo_total_life", Some(125.0));
+        folded.mod_type = ModType::Pseudo;
+        let item = ParsedItem {
+            base_type: "Opal Ring".to_string(),
+            rarity: Some(Rarity::Rare),
+            mods: vec![flat, folded],
+            ..Default::default()
+        };
+
+        // The subsumed flat row comes first and is off; the fold is on.
+        let body = build_search_body(
+            &item,
+            &[
+                FilterSpec { enabled: false, use_pseudo: true, ..Default::default() },
+                FilterSpec {
+                    enabled: true,
+                    use_pseudo: true,
+                    min: Some(125.0),
+                    ..Default::default()
+                },
+            ],
+            &MiscFilters::default(),
+        );
+
+        let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0]["disabled"], false);
+        assert_eq!(filters[0]["value"]["min"], 125.0);
+    }
+
+    #[test]
+    fn rate_limit_headers_parse_into_sliding_windows() {
+        use ureq::http::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rate-limit-rules", HeaderValue::from_static("Ip"));
+        // The live trade-search policy, verbatim.
+        headers.insert(
+            "x-rate-limit-ip",
+            HeaderValue::from_static("5:10:60,15:60:300,30:300:1800,600:21600:3600"),
+        );
+
+        // The third field is GGG's penalty for a violation, not a limit.
+        assert_eq!(
+            buckets_from_headers(&headers),
+            vec![
+                Bucket { max: 5, window: 10.0 },
+                Bucket { max: 15, window: 60.0 },
+                Bucket { max: 30, window: 300.0 },
+                Bucket { max: 600, window: 21600.0 },
+            ]
+        );
+
+        // A response with no rate-limit headers imposes no limits.
+        assert!(buckets_from_headers(&HeaderMap::new()).is_empty());
+
+        // A rule with no matching header is skipped rather than panicking.
+        let mut partial = HeaderMap::new();
+        partial.insert("x-rate-limit-rules", HeaderValue::from_static("Ip,Account"));
+        partial.insert("x-rate-limit-ip", HeaderValue::from_static("5:10:60"));
+        assert_eq!(
+            buckets_from_headers(&partial),
+            vec![Bucket { max: 5, window: 10.0 }]
+        );
     }
 
     #[test]

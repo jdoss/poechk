@@ -114,8 +114,17 @@ pub struct ParsedMod {
     pub slot: Option<Slot>,
     /// The matched template (rolls replaced by `#`).
     pub template: String,
-    /// The numeric rolls, in order.
+    /// The numeric rolls, in order. Empty for an option stat, whose text is
+    /// picked from a list rather than rolled.
     pub rolls: Vec<f64>,
+    /// Trade option id, for stats the trade site selects from a fixed list
+    /// (cluster jewel enchants, "Allocates #", …) instead of a roll range.
+    #[serde(default)]
+    pub option: Option<i64>,
+    /// Whether a lower roll is better, so the filter should cap rather than
+    /// floor it (a cluster jewel's added passive count).
+    #[serde(default)]
+    pub lower_is_better: bool,
     /// Canonical English stat reference.
     pub stat_ref: String,
     /// Trade stat-ids for this mod type.
@@ -203,6 +212,15 @@ fn strip_metadata(line: &str) -> &str {
     line.split('\u{2014}').next().unwrap_or(line).trim()
 }
 
+/// The stat text of a printed line, with its ` (implicit)`/… type marker and
+/// any ` — <metadata>` tail removed. Callers that join two printed lines into
+/// one mod need this: only the final line's marker is stripped by [`parse_mod`],
+/// so an inner line would otherwise carry its marker into the match.
+pub fn line_body(line: &str) -> &str {
+    let (_, rest) = ModType::from_suffix(line.trim());
+    strip_metadata(rest)
+}
+
 /// Resolve a printed mod line to a [`ParsedMod`], or `None` if unknown.
 ///
 /// `context` is the (type, slot) from a preceding advanced `{ … }` info line,
@@ -244,7 +262,16 @@ pub fn parse_mod(
             // "reduced" matchers map to the "increased" stat with the sign
             // flipped (60% reduced mana == -60% increased mana).
             let sign = if stat.negate { -1.0 } else { 1.0 };
-            let rolls = if candidate_rolls.is_empty() {
+            // An option stat's `value` is its trade option id, not a roll, so
+            // it selects the listing text instead of bounding a range.
+            let option = if stat.is_option {
+                stat.value.map(|v| v as i64)
+            } else {
+                None
+            };
+            let rolls = if option.is_some() {
+                Vec::new()
+            } else if candidate_rolls.is_empty() {
                 stat.value.map(|v| vec![v]).unwrap_or_default()
             } else {
                 candidate_rolls.iter().map(|roll| roll * sign).collect()
@@ -268,6 +295,8 @@ pub fn parse_mod(
                 slot,
                 template: candidate.clone(),
                 rolls,
+                option,
+                lower_is_better: stat.lower_is_better,
                 stat_ref: stat.stat_ref.clone(),
                 trade_ids: ids.clone(),
                 explicit_ids,
