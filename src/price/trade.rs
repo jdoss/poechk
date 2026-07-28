@@ -8,6 +8,7 @@
 //! responses.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -423,6 +424,36 @@ pub struct Account {
     pub name: String,
 }
 
+/// How long GGG's `Retry-After` asks us to hold off, when it says so.
+fn retry_after(headers: &ureq::http::HeaderMap) -> Option<Duration> {
+    let seconds: f64 = headers.get("retry-after")?.to_str().ok()?.trim().parse().ok()?;
+    (seconds > 0.0).then(|| Duration::from_secs_f64(seconds))
+}
+
+/// GGG's shortest advertised penalty, used when a 429 carries no `Retry-After`.
+const DEFAULT_PENALTY: Duration = Duration::from_secs(60);
+
+/// Turn a 429 into a recorded penalty and an error naming the wait. Returns
+/// `Ok(())` for any other status so the caller can handle it normally.
+fn note_rate_limit(
+    endpoint: &str,
+    status: u16,
+    headers: &ureq::http::HeaderMap,
+    limiter: &RateLimiter,
+) -> anyhow::Result<()> {
+    if status != 429 {
+        return Ok(());
+    }
+    let penalty = retry_after(headers).unwrap_or(DEFAULT_PENALTY);
+    // Persist it so the next press — and any other check process — waits rather
+    // than spending the request and deepening the penalty.
+    limiter.penalize(endpoint, penalty);
+    anyhow::bail!(
+        "rate limited by the trade API — retry in {}s",
+        penalty.as_secs()
+    )
+}
+
 /// The sliding-window limits a response advertises, read from the
 /// `x-rate-limit-<rule>` headers. Each is a `max:window:penalty` triple —
 /// "5:10:60,15:60:300" means at most 5 requests per 10s and 15 per 60s. The
@@ -482,7 +513,7 @@ impl TradeSource {
         let body = build_search_body(item, filters, misc);
         let limiter = RateLimiter::open()?;
 
-        limiter.wait("search", self.latency_margin);
+        limiter.wait("search", self.latency_margin)?;
         let search = self.search(&body, &limiter)?;
         let url = search_url(&self.league, &search.id);
         if search.result.is_empty() {
@@ -495,7 +526,7 @@ impl TradeSource {
         }
         let ids: Vec<String> = search.result.iter().take(FETCH_LIMIT).cloned().collect();
 
-        limiter.wait("fetch", self.latency_margin);
+        limiter.wait("fetch", self.latency_margin)?;
         let listings = self.fetch(&ids, &search.id, &limiter)?;
 
         let quotes = listings
@@ -538,6 +569,7 @@ impl TradeSource {
             .map_err(|e| anyhow::anyhow!("trade search request failed: {e}"))?;
         limiter.record("search", &buckets_from_headers(resp.headers()));
         let status = resp.status().as_u16();
+        note_rate_limit("search", status, resp.headers(), limiter)?;
         if !(200..300).contains(&status) {
             anyhow::bail!(
                 "trade search rejected ({})",
@@ -575,6 +607,7 @@ impl TradeSource {
             .map_err(|e| anyhow::anyhow!("trade fetch request failed: {e}"))?;
         limiter.record("fetch", &buckets_from_headers(resp.headers()));
         let status = resp.status().as_u16();
+        note_rate_limit("fetch", status, resp.headers(), limiter)?;
         if !(200..300).contains(&status) {
             anyhow::bail!(
                 "trade fetch rejected ({})",
@@ -942,6 +975,66 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0]["disabled"], false);
         assert_eq!(filters[0]["value"]["min"], 125.0);
+    }
+
+    #[test]
+    fn a_429_records_the_penalty_and_reports_the_wait() {
+        use ureq::http::{HeaderMap, HeaderValue};
+
+        let path = std::env::temp_dir().join("poechk-ratelimit-note429.json");
+        let _ = std::fs::remove_file(&path);
+        let limiter = RateLimiter::at(path);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("300"));
+
+        // Anything that is not a 429 is left to the caller's normal handling.
+        for ok in [200, 400, 404, 503] {
+            assert!(note_rate_limit("search", ok, &headers, &limiter).is_ok(), "{ok}");
+        }
+
+        let err = note_rate_limit("search", 429, &headers, &limiter)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("300s"), "should name the wait: {err:?}");
+
+        // The penalty was persisted, so the next attempt is refused up front
+        // instead of spending a request and deepening it.
+        let blocked = limiter.wait("search", 0.0).unwrap_err().to_string();
+        assert!(blocked.contains("still rate limited"), "got {blocked:?}");
+    }
+
+    #[test]
+    fn a_429_without_retry_after_falls_back_to_a_minute() {
+        use ureq::http::HeaderMap;
+
+        let path = std::env::temp_dir().join("poechk-ratelimit-note429-bare.json");
+        let _ = std::fs::remove_file(&path);
+        let limiter = RateLimiter::at(path);
+
+        let err = note_rate_limit("fetch", 429, &HeaderMap::new(), &limiter)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("60s"), "expected the default penalty: {err:?}");
+    }
+
+    #[test]
+    fn retry_after_is_read_when_present_and_sane() {
+        use ureq::http::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("60"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(60)));
+
+        // A 429 need not carry the header; the caller falls back.
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+
+        // Garbage and non-positive values are ignored rather than trusted.
+        for bogus in ["soon", "", "-5", "0"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_str(bogus).unwrap());
+            assert_eq!(retry_after(&headers), None, "for {bogus:?}");
+        }
     }
 
     #[test]

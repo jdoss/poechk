@@ -33,6 +33,11 @@ struct State {
     /// Endpoint -> unix times (seconds) of recent requests, oldest first.
     #[serde(default)]
     history: HashMap<String, Vec<f64>>,
+    /// Endpoint -> unix time a 429 penalty expires. GGG hands these out in
+    /// multiples of a minute and up to an hour, so they are waited out across
+    /// runs rather than slept through.
+    #[serde(default)]
+    blocked_until: HashMap<String, f64>,
 }
 
 /// Coordinates trade-API request pacing via a shared state file.
@@ -54,17 +59,45 @@ impl RateLimiter {
 
     /// Block until `endpoint` has room in every advertised window. `margin`
     /// pads each wait to absorb the round-trip GGG measures but we don't.
-    pub fn wait(&self, endpoint: &str, margin: f64) {
+    ///
+    /// Errors instead of sleeping while a 429 penalty is in force: those run to
+    /// an hour, so the caller reports the remaining time rather than hanging.
+    pub fn wait(&self, endpoint: &str, margin: f64) -> anyhow::Result<()> {
         let state = self.load();
+        if let Some(remaining) = state.penalty_remaining(endpoint, now_secs()) {
+            anyhow::bail!(
+                "still rate limited by the trade API — retry in {}",
+                humanise(remaining)
+            );
+        }
         let (Some(limits), Some(history)) =
             (state.limits.get(endpoint), state.history.get(endpoint))
         else {
-            return;
+            return Ok(());
         };
         let delay = delay_for(limits, history, now_secs(), margin);
         if delay > 0.0 {
             tracing::debug!(endpoint, delay, "rate limit: waiting for a free slot");
             std::thread::sleep(Duration::from_secs_f64(delay));
+        }
+        Ok(())
+    }
+
+    /// A limiter over an explicit state file, for tests.
+    #[cfg(test)]
+    pub fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Record a 429: hold every request to `endpoint` for `penalty`.
+    pub fn penalize(&self, endpoint: &str, penalty: Duration) {
+        let mut state = self.load();
+        state
+            .blocked_until
+            .insert(endpoint.to_string(), now_secs() + penalty.as_secs_f64());
+        tracing::warn!(endpoint, penalty = penalty.as_secs_f64(), "rate limited");
+        if let Err(e) = self.save(&state) {
+            tracing::warn!("could not persist rate-limit penalty: {e}");
         }
     }
 
@@ -100,6 +133,23 @@ impl RateLimiter {
         let text = serde_json::to_string(state)?;
         std::fs::write(&self.path, text)
             .with_context(|| format!("writing {}", self.path.display()))
+    }
+}
+
+impl State {
+    /// How much of `endpoint`'s 429 penalty is left, or `None` once it lapses.
+    fn penalty_remaining(&self, endpoint: &str, now: f64) -> Option<Duration> {
+        let until = *self.blocked_until.get(endpoint)?;
+        (until > now).then(|| Duration::from_secs_f64(until - now))
+    }
+}
+
+/// A penalty as something to say out loud: "45s", "3m 20s".
+fn humanise(remaining: Duration) -> String {
+    let secs = remaining.as_secs();
+    match secs / 60 {
+        0 => format!("{secs}s"),
+        minutes => format!("{minutes}m {}s", secs % 60),
     }
 }
 
@@ -184,6 +234,50 @@ mod tests {
         let history: Vec<f64> = (0..15).map(|i| now - 30.0 + i as f64 * 2.0).collect();
         let delay = delay_for(&trade_limits(), &history, now, 0.0);
         assert!((delay - 30.0).abs() < 1e-9, "expected 30s, got {delay}");
+    }
+
+    /// A limiter backed by a throwaway state file.
+    fn limiter_at(name: &str) -> RateLimiter {
+        let path = std::env::temp_dir().join(format!("poechk-ratelimit-{name}.json"));
+        let _ = std::fs::remove_file(&path);
+        RateLimiter::at(path)
+    }
+
+    #[test]
+    fn a_penalty_refuses_requests_until_it_lapses() {
+        let limiter = limiter_at("penalty");
+        // No penalty recorded: pacing applies, but nothing blocks.
+        assert!(limiter.wait("search", 0.0).is_ok());
+
+        limiter.penalize("search", Duration::from_secs(90));
+        let err = limiter.wait("search", 0.0).unwrap_err().to_string();
+        assert!(err.contains("still rate limited"), "got {err:?}");
+        assert!(err.contains("1m"), "should name the remaining wait: {err:?}");
+
+        // The penalty is per endpoint: a fetch is not blocked by a search 429.
+        assert!(limiter.wait("fetch", 0.0).is_ok());
+
+        // It lapses rather than blocking forever.
+        limiter.penalize("search", Duration::from_secs(0));
+        assert!(limiter.wait("search", 0.0).is_ok());
+    }
+
+    #[test]
+    fn a_penalty_outlives_the_process_that_hit_it() {
+        let limiter = limiter_at("persist");
+        limiter.penalize("search", Duration::from_secs(120));
+        // A separate limiter over the same file — a second `check` run — sees it.
+        let path = std::env::temp_dir().join("poechk-ratelimit-persist.json");
+        let other = RateLimiter::at(path);
+        assert!(other.wait("search", 0.0).is_err());
+    }
+
+    #[test]
+    fn remaining_time_reads_as_minutes_and_seconds() {
+        assert_eq!(humanise(Duration::from_secs(45)), "45s");
+        assert_eq!(humanise(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(humanise(Duration::from_secs(200)), "3m 20s");
+        assert_eq!(humanise(Duration::from_secs(3600)), "60m 0s");
     }
 
     #[test]
