@@ -610,7 +610,7 @@ Fractured Item
     }
 
     // A magic cluster jewel: the name plate carries the affixes, the enchant
-    // block reads "Label: value", and the enchant text is an option stat.
+    // block reads "Label: value", and each enchant text is its own trade stat.
     const CLUSTER_JEWEL: &str = r#"Item Class: Jewels
 Rarity: Magic
 Medium Cluster Jewel of the Lost
@@ -656,22 +656,24 @@ Place into an allocated Medium or Large Jewel Socket on the Passive Skill Tree. 
     }
 
     #[test]
-    fn cluster_jewel_enchant_resolves_to_a_trade_option() {
+    fn cluster_jewel_enchant_resolves_to_a_trade_stat_id() {
         let stats = load_stats();
         let items = load_items();
         let item = parse_item(CLUSTER_JEWEL, Game::Poe1, &stats, &items).unwrap();
 
         // The colon in "Added Small Passive Skills grant: …" must not get the
         // line skipped as a requirement/label line.
+        const GRANTED: &str =
+            "Added Small Passive Skills grant: Minions have 12% increased maximum Life";
         let granted = item
             .mods
             .iter()
-            .find(|m| m.stat_ref == "Added Small Passive Skills grant: #")
+            .find(|m| m.stat_ref == GRANTED)
             .expect("the small-passive enchant resolves");
         assert_eq!(granted.mod_type, ModType::Enchant);
-        assert_eq!(granted.trade_ids, vec!["enchant.stat_3948993189".to_string()]);
-        // Minions have 12% increased maximum Life is option 30, not a roll.
-        assert_eq!(granted.option, Some(30));
+        // Each granted passive is its own stat id (`|30`) with no roll.
+        assert_eq!(granted.trade_ids, vec!["enchant.stat_3948993189|30".to_string()]);
+        assert_eq!(granted.option, None);
         assert!(granted.rolls.is_empty());
 
         // The suffix's "also grant" explicit is a normal rolled stat.
@@ -712,8 +714,8 @@ Place into an allocated Medium or Large Jewel Socket on the Passive Skill Tree. 
     }
 
     #[test]
-    fn two_line_cluster_enchant_folds_into_one_option() {
-        // The trap/mine enchant prints as two lines sharing a single option.
+    fn two_line_cluster_enchant_folds_into_one_mod() {
+        // The trap/mine enchant prints as two lines sharing a single stat id.
         const TRAP_MINE: &str = r#"Item Class: Jewels
 Rarity: Magic
 Large Cluster Jewel of the Lost
@@ -729,13 +731,14 @@ Added Small Passive Skills grant: 12% increased Mine Damage
         let items = load_items();
         let item = parse_item(TRAP_MINE, Game::Poe1, &stats, &items).unwrap();
 
+        const TRAP: &str = "Added Small Passive Skills grant: 12% increased Trap";
         let granted: Vec<&mods::ParsedMod> = item
             .mods
             .iter()
-            .filter(|m| m.stat_ref == "Added Small Passive Skills grant: #")
+            .filter(|m| m.stat_ref.starts_with(TRAP))
             .collect();
         assert_eq!(granted.len(), 1, "the two printed lines are one mod");
-        assert_eq!(granted[0].option, Some(33));
+        assert_eq!(granted[0].trade_ids, vec!["enchant.stat_3948993189|33".to_string()]);
         assert!(item.unknown_mods.is_empty(), "unresolved: {:?}", item.unknown_mods);
     }
 
@@ -768,11 +771,11 @@ Added Small Passive Skills also grant: +3(2-3) to Strength
         let granted: Vec<&mods::ParsedMod> = item
             .mods
             .iter()
-            .filter(|m| m.stat_ref == "Added Small Passive Skills grant: #")
+            .filter(|m| m.stat_ref.starts_with("Added Small Passive Skills grant: Axe Attacks"))
             .collect();
         assert_eq!(granted.len(), 1, "the Axe/Sword pair is one mod");
         assert_eq!(granted[0].mod_type, ModType::Enchant);
-        assert_eq!(granted[0].option, Some(1));
+        assert_eq!(granted[0].trade_ids, vec!["enchant.stat_3948993189|1".to_string()]);
 
         // A cluster jewel's notables drive its price, so they must resolve.
         assert!(

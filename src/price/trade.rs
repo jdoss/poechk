@@ -803,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_jewel_searches_by_option_and_caps_the_passive_count() {
+    fn cluster_jewel_searches_by_stat_id_and_caps_the_passive_count() {
         const CLUSTER_JEWEL: &str = r#"Item Class: Jewels
 Rarity: Magic
 Large Cluster Jewel of the Lost
@@ -830,9 +830,9 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
                 .unwrap_or_else(|| panic!("no filter for {id}"))
         };
 
-        // The enchant text picks a trade option, not a numeric range.
-        let granted = by_id("enchant.stat_3948993189");
-        assert_eq!(granted["value"]["option"], 17);
+        // The enchant text is its own stat id, searched without a numeric range.
+        let granted = by_id("enchant.stat_3948993189|17");
+        assert!(granted["value"].get("option").is_none());
         assert!(granted["value"].get("min").is_none());
 
         // Fewer added passives is better, so 8 is the cap, not the floor.
