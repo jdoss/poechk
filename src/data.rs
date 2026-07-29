@@ -299,7 +299,10 @@ mod tests {
     fn indexes_advanced_matcher_form() {
         let stats = load_stats();
         // The hoisted "advanced" form (with the hidden skill name) is indexed too.
-        let matches = stats.lookup("# to Level of all Absolution(Fireball-Divine Blast) Gems");
+        // The parenthetical names the gem range, so it shifts when new skill
+        // gems land; refresh it alongside the vendored data.
+        let advanced = "# to Level of all Absolution(Fireball-Mana-Infused Staff) Gems";
+        let matches = stats.lookup(advanced);
         assert!(matches.iter().any(|m| m.stat_ref.contains("Absolution")));
     }
 

@@ -123,12 +123,17 @@ adding the second game is a new profile + data, not a fork.
 
 ## Data files
 
-Vendored from APT `en/` (MIT; derived from GGG data via [RePoE]):
+Vendored from APT `en/` (MIT; derived from GGG data via [RePoE]), currently the
+3.29 snapshot:
 
-- `stats.ndjson` (~6960 lines) — mod text → trade stat id, keyed by mod type
+- `stats.ndjson` (~8198 lines) — mod text → trade stat id, keyed by mod type
   (explicit/implicit/fractured/enchant/crafted/pseudo/veiled).
-- `items.ndjson` (~4641 lines) — base types, uniques, gems, cards, beasts;
+- `items.ndjson` (~4738 lines) — base types, uniques, gems, cards, beasts;
   includes `tradeTag` for bulk exchange and poe.ninja lookup hints.
+
+Some stats are picked from a fixed list rather than rolled. Most now carry the
+choice in the id itself (`enchant.stat_3948993189|30`) and need no special
+handling; the ~85 that still set `trade.option` are searched by option id.
 
 A companion fnv index is built at load. PoE2 data comes from Exiled-Exchange-2.
 Attribution goes in a `NOTICE` file when the data lands (M2).
