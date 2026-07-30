@@ -78,7 +78,8 @@ Keyboard Shortcuts → Custom Shortcuts**:
 
 1. Hover an item in game and press **Ctrl+Alt+D**.
 2. The overlay opens with the item parsed: pseudo totals and prefilled affix
-   filters (uniques start name-only; crafted mods start unchecked).
+   filters (uniques start name-only; crafted mods and implicits start
+   unchecked — tick the implicits you actually want to pay for).
 3. Adjust — toggle affixes, edit min/max, cycle `Instant Buyout / Online /
    Any` and `Corrupted`, set sockets/links or DPS floors — then press
    **Search**.

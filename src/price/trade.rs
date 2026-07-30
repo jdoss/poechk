@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::checklog::{self, CheckLog};
 use crate::config::Config;
+use crate::item::mods::ModType;
 use crate::item::{ParsedItem, Rarity};
 use crate::price::PriceQuote;
 use crate::price::ratelimit::{Bucket, RateLimiter};
@@ -324,6 +325,11 @@ fn save_league_cache(ids: &[String]) {
 /// cap (max = roll) for stats where less is better — a cluster jewel's added
 /// passive count, where 8/8 beats 9/8. Crafted mods start disabled: any buyer
 /// can re-craft them, so they shouldn't constrain the search.
+///
+/// Implicits start disabled too. Requiring one narrows the search far harder
+/// than its contribution to price usually warrants — an Exarch/Eater pair at
+/// roll can cut a body armour's matches to a single listing before any affix
+/// is considered — so they are offered as a choice rather than assumed.
 pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
     let enabled = item.rarity != Some(Rarity::Unique);
     item.mods
@@ -331,7 +337,7 @@ pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
         .map(|m| {
             let roll = m.roll();
             FilterSpec {
-                enabled: enabled && m.mod_type != crate::item::mods::ModType::Crafted,
+                enabled: enabled && !matches!(m.mod_type, ModType::Crafted | ModType::Implicit),
                 as_explicit: false,
                 use_pseudo: !m.pseudo_ids.is_empty(),
                 min: roll.filter(|_| !m.lower_is_better).map(|r| round_outward(r, f64::floor)),
@@ -681,6 +687,51 @@ mod tests {
             explicit_ids: vec![id.to_string()],
             pseudo_ids: vec![],
         }
+    }
+
+    /// The case from a real check: a rare body armour whose Searing Exarch and
+    /// Eater of Worlds implicits, required at roll, cut the trade site to one
+    /// listing before any affix was applied.
+    #[test]
+    fn implicits_start_off_so_they_do_not_narrow_the_search_uninvited() {
+        let mut endurance = mod_with(
+            "Gain an Endurance Charge every # seconds",
+            "implicit.stat_2555092341",
+            Some(15.0),
+        );
+        endurance.mod_type = ModType::Implicit;
+        let mut phys_as_fire = mod_with(
+            "#% of Physical Damage from Hits taken as Fire Damage",
+            "implicit.stat_3342989455",
+            Some(10.0),
+        );
+        phys_as_fire.mod_type = ModType::Implicit;
+        let item = ParsedItem {
+            base_type: "Conquest Lamellar".to_string(),
+            rarity: Some(Rarity::Rare),
+            mods: vec![
+                endurance,
+                phys_as_fire,
+                mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(133.0)),
+            ],
+            ..Default::default()
+        };
+
+        let defaults = default_filters(&item);
+        assert!(!defaults[0].enabled, "implicits are the user's to opt into");
+        assert!(!defaults[1].enabled);
+        assert!(defaults[2].enabled, "explicit affixes still seed the search");
+
+        // Disabled rows still ride along so the overlay can offer them, but
+        // they carry no bound and so cannot constrain the query.
+        let filters = build_search_body(&item, &defaults, &MiscFilters::default())["query"]["stats"]
+            [0]["filters"]
+            .clone();
+        assert_eq!(filters[0]["id"], "implicit.stat_2555092341");
+        assert_eq!(filters[0]["disabled"], true);
+        assert!(filters[0].get("value").is_none());
+        assert_eq!(filters[2]["disabled"], false);
+        assert_eq!(filters[2]["value"]["min"], 133.0);
     }
 
     #[test]
