@@ -12,6 +12,7 @@ anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
 futures = "0.3.32"
+jiff = "0.2.31"
 libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", version = "1.0.0", default-features = false, features = ["tokio", "wayland", "winit"] }
 regex = "1.12.4"
 serde = { version = "1.0.228", features = ["derive"] }

@@ -8,11 +8,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+
+use crate::checklog;
 
 const USER_AGENT: &str = concat!(
     "poechk/",
@@ -31,9 +33,17 @@ struct Cache {
 /// The approximate chaos value of an item by its poe.ninja name, fetching or
 /// refreshing the league's cached economy map as needed.
 pub fn chaos_value(league: &str, name: &str) -> Option<f64> {
+    let log = checklog::CheckLog::open();
     match load(league) {
-        Ok(prices) => prices.get(name).copied(),
+        Ok(prices) => {
+            let chaos = prices.get(name).copied();
+            // A miss is the common bulk complaint ("it has no price"), so record
+            // the name looked up — it is usually a base-type spelling mismatch.
+            log.event("bulk_lookup", json!({ "name": name, "chaos": chaos }));
+            chaos
+        }
         Err(e) => {
+            log.event("bulk_lookup", json!({ "name": name, "error": e.to_string() }));
             tracing::warn!("poe.ninja lookup unavailable: {e}");
             None
         }
@@ -66,6 +76,9 @@ fn fetch(league: &str) -> anyhow::Result<HashMap<String, f64>> {
         "https://poe.ninja/poe1/api/economy/current/dense/overviews?league={}&language=en",
         league.replace(' ', "%20")
     );
+    let log = checklog::CheckLog::open();
+    log.event("ninja_req", json!({ "url": url }));
+    let started = Instant::now();
     let mut resp = ureq::get(&url)
         .header("User-Agent", USER_AGENT)
         .config()
@@ -75,9 +88,11 @@ fn fetch(league: &str) -> anyhow::Result<HashMap<String, f64>> {
         .map_err(|e| anyhow::anyhow!("poe.ninja request failed: {e}"))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
+        let raw = resp.body_mut().read_to_string().unwrap_or_default();
+        log.event("ninja_resp", json!({ "status": status, "body": checklog::body(&raw) }));
         anyhow::bail!(
             "poe.ninja rejected the request ({}) — it may not track league \"{league}\"",
-            crate::price::api_error(status, resp.body_mut())
+            crate::price::api_error(status, &raw)
         );
     }
     let blob: Value = resp
@@ -86,7 +101,17 @@ fn fetch(league: &str) -> anyhow::Result<HashMap<String, f64>> {
         .limit(64 * 1024 * 1024)
         .read_json()
         .map_err(|e| anyhow::anyhow!("parsing poe.ninja response: {e}"))?;
-    Ok(condense(&blob))
+    let prices = condense(&blob);
+    // The overview runs to tens of MB, so only its shape is worth recording.
+    log.event(
+        "ninja_resp",
+        json!({
+            "status": status,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "prices": prices.len(),
+        }),
+    );
+    Ok(prices)
 }
 
 /// Reduce the dense overview blob to a name -> chaos map.
