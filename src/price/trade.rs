@@ -3,16 +3,16 @@
 //! The flow is `build_search_body` → POST `/api/trade/search/{league}` →
 //! GET `/api/trade/fetch/{ids}?query={id}` (<=10 ids) → listing prices. Requests
 //! go through a file-based rate limiter (see `ratelimit`) that honours GGG's
-//! `x-rate-limit-*` headers across `check` processes. The HTTP client and rate
-//! limiter land next; this file currently builds the request and models the
-//! responses.
+//! `x-rate-limit-*` headers across `check` processes. Every request and its raw
+//! response is recorded to the check log (see `checklog`).
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::checklog::{self, CheckLog};
 use crate::config::Config;
 use crate::item::{ParsedItem, Rarity};
 use crate::price::PriceQuote;
@@ -482,6 +482,15 @@ fn buckets_from_headers(headers: &ureq::http::HeaderMap) -> Vec<Bucket> {
     buckets
 }
 
+/// Read a response body to text so it can be both logged verbatim and parsed.
+///
+/// Separate from parsing so that a truncated transfer says so, rather than
+/// reaching the parser as an empty body and surfacing as "EOF while parsing".
+fn read_body(body: &mut ureq::Body, what: &str) -> anyhow::Result<String> {
+    body.read_to_string()
+        .map_err(|e| anyhow::anyhow!("reading {what} response: {e}"))
+}
+
 /// Prices items against the official trade search + fetch endpoints.
 #[derive(Debug)]
 pub struct TradeSource {
@@ -489,6 +498,7 @@ pub struct TradeSource {
     league: String,
     poesessid: Option<String>,
     latency_margin: f64,
+    log: CheckLog,
 }
 
 impl TradeSource {
@@ -499,6 +509,7 @@ impl TradeSource {
             league: cfg.league.clone(),
             poesessid: cfg.poesessid.clone(),
             latency_margin: cfg.api_latency_seconds,
+            log: CheckLog::open(),
         }
     }
 
@@ -517,6 +528,8 @@ impl TradeSource {
         let search = self.search(&body, &limiter)?;
         let url = search_url(&self.league, &search.id);
         if search.result.is_empty() {
+            self.log
+                .event("priced", json!({ "url": url, "total": search.total, "quotes": 0 }));
             return Ok(PriceResult {
                 url,
                 total: search.total,
@@ -539,7 +552,11 @@ impl TradeSource {
                     source: "trade".to_string(),
                 })
             })
-            .collect();
+            .collect::<Vec<PriceQuote>>();
+        self.log.event(
+            "priced",
+            json!({ "url": url, "total": search.total, "quotes": quotes.len() }),
+        );
         Ok(PriceResult {
             url,
             total: search.total,
@@ -561,23 +578,34 @@ impl TradeSource {
         if let Some(sess) = &self.poesessid {
             req = req.header("Cookie", format!("POESESSID={sess}"));
         }
+        self.log.event("search_req", json!({ "url": url, "body": body }));
+        let started = Instant::now();
         let mut resp = req
             .config()
             .http_status_as_error(false)
             .build()
             .send_json(body)
+            .inspect_err(|e| self.log.event("search_failed", json!({ "error": e.to_string() })))
             .map_err(|e| anyhow::anyhow!("trade search request failed: {e}"))?;
         limiter.record("search", &buckets_from_headers(resp.headers()));
         let status = resp.status().as_u16();
+        let raw = read_body(resp.body_mut(), "trade search").inspect_err(|e| {
+            self.log
+                .event("search_failed", json!({ "status": status, "error": e.to_string() }))
+        })?;
+        self.log.event(
+            "search_resp",
+            json!({
+                "status": status,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "body": checklog::body(&raw),
+            }),
+        );
         note_rate_limit("search", status, resp.headers(), limiter)?;
         if !(200..300).contains(&status) {
-            anyhow::bail!(
-                "trade search rejected ({})",
-                crate::price::api_error(status, resp.body_mut())
-            );
+            anyhow::bail!("trade search rejected ({})", crate::price::api_error(status, &raw));
         }
-        resp.body_mut()
-            .read_json()
+        serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parsing trade search response: {e}"))
     }
 
@@ -599,24 +627,36 @@ impl TradeSource {
         if let Some(sess) = &self.poesessid {
             req = req.header("Cookie", format!("POESESSID={sess}"));
         }
+        // The ids are in the url, and the search response holds the full result
+        // list they came from, so logging them again would only pad the line.
+        self.log.event("fetch_req", json!({ "url": url }));
+        let started = Instant::now();
         let mut resp = req
             .config()
             .http_status_as_error(false)
             .build()
             .call()
+            .inspect_err(|e| self.log.event("fetch_failed", json!({ "error": e.to_string() })))
             .map_err(|e| anyhow::anyhow!("trade fetch request failed: {e}"))?;
         limiter.record("fetch", &buckets_from_headers(resp.headers()));
         let status = resp.status().as_u16();
+        let raw = read_body(resp.body_mut(), "trade fetch").inspect_err(|e| {
+            self.log
+                .event("fetch_failed", json!({ "status": status, "error": e.to_string() }))
+        })?;
+        self.log.event(
+            "fetch_resp",
+            json!({
+                "status": status,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "body": checklog::body(&raw),
+            }),
+        );
         note_rate_limit("fetch", status, resp.headers(), limiter)?;
         if !(200..300).contains(&status) {
-            anyhow::bail!(
-                "trade fetch rejected ({})",
-                crate::price::api_error(status, resp.body_mut())
-            );
+            anyhow::bail!("trade fetch rejected ({})", crate::price::api_error(status, &raw));
         }
-        let parsed: FetchResponse = resp
-            .body_mut()
-            .read_json()
+        let parsed: FetchResponse = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parsing trade fetch response: {e}"))?;
         Ok(parsed.result)
     }
@@ -1125,5 +1165,44 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
         assert_eq!(Status::InstantBuyout.next(), Status::Online);
         assert_eq!(Status::Online.next(), Status::Any);
         assert_eq!(Status::Any.next(), Status::InstantBuyout);
+    }
+
+    /// Both endpoints read their body to text (so the check log can keep it
+    /// verbatim) and parse from that, so the wire shapes are worth pinning.
+    /// These payloads are trimmed from real responses.
+    #[test]
+    fn a_search_response_parses_from_the_wire_shape() {
+        let raw = r#"{"id":"8rRdMpqvUV","complexity":13,
+            "result":["18087588112","e2370ad6493"],"total":2}"#;
+        let parsed: SearchResponse = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(parsed.id, "8rRdMpqvUV");
+        assert_eq!(parsed.total, 2);
+        assert_eq!(parsed.result, ["18087588112", "e2370ad6493"]);
+    }
+
+    #[test]
+    fn a_fetch_response_keeps_unpriced_and_expired_listings_in_place() {
+        let raw = r#"{"result":[
+            {"id":"a","listing":{"method":"psapi","indexed":"2026-07-30T18:02:11Z",
+                "account":{"name":"Seller","online":null,"realm":"pc"},
+                "price":{"type":"~b/o","amount":1,"currency":"divine"},
+                "whisper":"@Seller hi","stash":{"name":"~b/o 1 divine"}}},
+            null,
+            {"id":"c","listing":{"method":"psapi",
+                "account":{"name":"Other","realm":"pc"},"price":null}}
+        ]}"#;
+        let parsed: FetchResponse = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(parsed.result.len(), 3);
+        let first = parsed.result[0].as_ref().unwrap();
+        assert_eq!(first.listing.price.as_ref().unwrap().amount, 1.0);
+        assert_eq!(first.listing.price.as_ref().unwrap().currency, "divine");
+        assert_eq!(first.listing.account.name, "Seller");
+        assert_eq!(first.listing.indexed.as_deref(), Some("2026-07-30T18:02:11Z"));
+        // An expired listing comes back as null, and a listing can carry no
+        // price at all; both must survive so the positions still line up.
+        assert!(parsed.result[1].is_none());
+        assert!(parsed.result[2].as_ref().unwrap().listing.price.is_none());
     }
 }

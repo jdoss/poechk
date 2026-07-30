@@ -107,6 +107,31 @@ Get the value from a browser logged into pathofexile.com: DevTools → Storage/
 Application → Cookies → `POESESSID`. Treat it like a password — it is your
 login. poechk only sends it to `www.pathofexile.com`.
 
+## Logs
+
+A check launched from a desktop shortcut has no terminal, so poechk writes to
+`~/.local/state/poechk/`:
+
+| file | contents |
+|------|----------|
+| `checks.jsonl` | one JSON object per event: the item text, the parsed item, the exact search body sent to the trade API, and the raw responses |
+| `poechk.log` | the same messages that go to stderr |
+
+Both roll over at 32 MB, keeping one previous file (`.1`). Every line of a
+single check shares a `check` id, so to read the last check:
+
+```sh
+tail -1 ~/.local/state/poechk/checks.jsonl | jq -r .check |
+  xargs -I{} rg '"check":"{}"' ~/.local/state/poechk/checks.jsonl | jq .
+```
+
+Useful when a price looks wrong: `search_req.body` is exactly what was asked
+for, and `search_resp.body` is exactly what came back.
+
+Your `POESESSID` is never written — only whether one was sent. Listings do
+carry seller account names, so the log is about as private as your trade
+history.
+
 ## How it works
 
 One binary, no daemon. The COSMIC shortcut spawns `poechk check --copy`,

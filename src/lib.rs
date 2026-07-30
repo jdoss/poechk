@@ -4,6 +4,7 @@
 //! selected by subcommand. See `DESIGN.md` for the architecture and roadmap.
 
 pub mod check;
+pub mod checklog;
 pub mod config;
 pub mod data;
 pub mod inject;

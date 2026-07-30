@@ -8,8 +8,9 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use serde_json::json;
 
-use crate::{config, item, overlay};
+use crate::{checklog, config, item, overlay};
 
 /// Sentinel seeded onto the clipboard so the game's copy is detectable.
 const COPY_SENTINEL: &str = "POECHK_AWAITING_ITEM_COPY";
@@ -29,6 +30,18 @@ const POLL_GAP: Duration = Duration::from_millis(40);
 /// clipboard and show the interactive overlay.
 pub fn run(copy: bool) -> anyhow::Result<()> {
     let cfg = config::load()?;
+    let log = checklog::CheckLog::open();
+    log.event(
+        "check_start",
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "game": cfg.game,
+            "league": cfg.league,
+            "copy": copy,
+            // Never the value: a POESESSID is a live session cookie.
+            "authenticated": cfg.poesessid.is_some(),
+        }),
+    );
     let text = if copy { capture_item_text()? } else { read_clipboard()? };
     let stats = crate::data::load_stats();
     let items = crate::data::load_items();
@@ -36,12 +49,14 @@ pub fn run(copy: bool) -> anyhow::Result<()> {
     let parsed = match item::parse::parse_item(&text, cfg.game, &stats, &items) {
         Ok(parsed) => parsed,
         Err(e) => {
+            log.event("parse_failed", json!({ "clipboard": text, "error": e.to_string() }));
             tracing::warn!(
                 "clipboard is not a Path of Exile item ({e}); hover an item and press Ctrl+Alt+C first"
             );
             return Ok(());
         }
     };
+    log.event("parsed", json!({ "clipboard": text, "item": parsed }));
     tracing::info!(
         class = %parsed.item_class,
         base = %parsed.base_type,
