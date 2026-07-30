@@ -83,6 +83,10 @@ Keyboard Shortcuts → Custom Shortcuts**:
 3. Adjust — toggle affixes, edit min/max, cycle `Instant Buyout / Online /
    Any` and `Corrupted`, set sockets/links or DPS floors — then press
    **Search**.
+   Gear searches its whole class by default (`Class: Dagger`), since one base
+   type is usually too thin a market to price against. Click it for
+   `Base: Ambusher` when the base itself is what you're selling. Items defined
+   by their base — maps, flasks, cluster jewels — always search the base.
 4. Cheapest listings show as price bands with the total match count.
    **Open in browser** lands on the same search on the trade site.
 5. **Esc** (or clicking away) closes the overlay.

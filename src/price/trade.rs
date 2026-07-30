@@ -104,6 +104,9 @@ pub struct MiscFilters {
     pub pdps_min: Option<f64>,
     /// Minimum elemental DPS (weapons).
     pub edps_min: Option<f64>,
+    /// Search this exact base type instead of its class. Off by default: one
+    /// base is usually too thin a market to price against.
+    pub exact_base: bool,
 }
 
 /// The outcome of a price search: the trade-site URL for it, the total match
@@ -129,7 +132,6 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
 
     let mut query = json!({
         "status": { "option": misc.status.option() },
-        "type": item.base_type,
         "stats": [ { "type": "and", "filters": stat_filters } ],
     });
     // Uniques are found by name; the base type alone is ambiguous.
@@ -138,11 +140,44 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
     {
         query["name"] = json!(name);
     }
-    if let Some(groups) = item_filter_groups(misc) {
-        query["filters"] = groups;
+    match search_class(item, misc) {
+        Some(category) => query["filters"] = filter_groups(misc, Some(category)),
+        None => {
+            query["type"] = json!(item.base_type);
+            if let Some(groups) = item_filter_groups(misc) {
+                query["filters"] = groups;
+            }
+        }
     }
 
     json!({ "query": query, "sort": { "price": "asc" } })
+}
+
+/// The trade category to search instead of the base type, or `None` to search
+/// the base type itself.
+///
+/// A unique keeps its base type: it is already pinned by name, and widening to
+/// the class would pull in every other unique sharing it.
+fn search_class(item: &ParsedItem, misc: &MiscFilters) -> Option<&'static str> {
+    if misc.exact_base || item.rarity == Some(Rarity::Unique) {
+        return None;
+    }
+    crate::price::category::trade_category(item)
+}
+
+/// `item_filter_groups` with the type-filter group carrying `category` added.
+fn filter_groups(misc: &MiscFilters, category: Option<&str>) -> Value {
+    let mut groups = match item_filter_groups(misc) {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    if let Some(category) = category {
+        groups.insert(
+            "type_filters".to_string(),
+            json!({ "filters": { "category": { "option": category } } }),
+        );
+    }
+    Value::Object(groups)
 }
 
 /// Collapse filters that target the same trade stat id into one.
@@ -687,6 +722,96 @@ mod tests {
             explicit_ids: vec![id.to_string()],
             pseudo_ids: vec![],
         }
+    }
+
+    fn rare_dagger() -> ParsedItem {
+        ParsedItem {
+            base_type: "Ambusher".to_string(),
+            item_class: "Daggers".to_string(),
+            category: Some("Dagger".to_string()),
+            rarity: Some(Rarity::Rare),
+            mods: vec![mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(70.0))],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_search_asks_for_the_item_class_rather_than_its_base_type() {
+        let item = rare_dagger();
+        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+
+        // One base is too thin a market to price against, so the class is the
+        // default and the base type drops out of the query entirely.
+        assert_eq!(
+            body["query"]["filters"]["type_filters"]["filters"]["category"]["option"],
+            "weapon.basedagger"
+        );
+        assert!(body["query"].get("type").is_none());
+        // The affixes still do the discriminating.
+        assert_eq!(body["query"]["stats"][0]["filters"][0]["value"]["min"], 70.0);
+    }
+
+    #[test]
+    fn exact_base_swaps_the_class_back_for_the_base_type() {
+        let item = rare_dagger();
+        let misc = MiscFilters {
+            exact_base: true,
+            ..Default::default()
+        };
+        let body = build_search_body(&item, &default_filters(&item), &misc);
+
+        assert_eq!(body["query"]["type"], "Ambusher");
+        assert!(body["query"]["filters"].get("type_filters").is_none());
+    }
+
+    #[test]
+    fn the_class_filter_joins_the_other_filter_groups_rather_than_replacing_them() {
+        let item = rare_dagger();
+        let misc = MiscFilters {
+            ilvl_min: Some(84),
+            dps_min: Some(400.0),
+            ..Default::default()
+        };
+        let body = build_search_body(&item, &default_filters(&item), &misc);
+        let groups = &body["query"]["filters"];
+
+        assert_eq!(groups["type_filters"]["filters"]["category"]["option"], "weapon.basedagger");
+        assert_eq!(groups["misc_filters"]["filters"]["ilvl"]["min"], 84);
+        assert_eq!(groups["weapon_filters"]["filters"]["dps"]["min"], 400.0);
+    }
+
+    #[test]
+    fn a_unique_keeps_its_base_type_however_broad_its_class_would_be() {
+        let item = ParsedItem {
+            base_type: "Ambusher".to_string(),
+            item_class: "Daggers".to_string(),
+            category: Some("Dagger".to_string()),
+            name: Some("Cospri's Malice".to_string()),
+            rarity: Some(Rarity::Unique),
+            ..Default::default()
+        };
+        let body = build_search_body(&item, &[], &MiscFilters::default());
+
+        // Widening a unique to its class would price it against every other
+        // unique sharing the base.
+        assert_eq!(body["query"]["name"], "Cospri's Malice");
+        assert_eq!(body["query"]["type"], "Ambusher");
+        assert!(body["query"]["filters"].get("type_filters").is_none());
+    }
+
+    #[test]
+    fn a_class_with_no_trade_category_still_searches_its_base_type() {
+        let item = ParsedItem {
+            base_type: "Cemetery Map".to_string(),
+            item_class: "Maps".to_string(),
+            category: Some("Map".to_string()),
+            rarity: Some(Rarity::Rare),
+            ..Default::default()
+        };
+        let body = build_search_body(&item, &[], &MiscFilters::default());
+
+        assert_eq!(body["query"]["type"], "Cemetery Map");
+        assert!(body["query"].get("filters").is_none());
     }
 
     /// The case from a real check: a rare body armour whose Searing Exarch and
