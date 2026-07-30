@@ -47,20 +47,22 @@ pub struct FilterSpec {
 /// The trade "status" filter — which sellers/listings to include.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Status {
-    /// Buyable now: online seller with a buyout price (Awakened's default).
+    /// Secured market listings only: buyable outright, no in-person trade.
     #[default]
     InstantBuyout,
-    /// Any online seller.
+    /// Any online seller, in-person trades included.
     Online,
     /// Everything, including offline listings.
     Any,
 }
 
 impl Status {
-    /// The trade API `status.option` value.
+    /// The trade API `status.option` value. `available` is not the instant
+    /// tier — it means "online and priced", which still includes in-person
+    /// trades; only `securable` restricts the search to market listings.
     pub fn option(self) -> &'static str {
         match self {
-            Status::InstantBuyout => "available",
+            Status::InstantBuyout => "securable",
             Status::Online => "online",
             Status::Any => "any",
         }
@@ -124,8 +126,6 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
             .filter_map(|(i, m)| filters.get(i).and_then(|spec| stat_filter(m, spec))),
     );
 
-    // "any" (not "online") for valuation: fairly-priced sellers are often
-    // offline, so online-only skews high. (Online/any toggle: later.)
     let mut query = json!({
         "status": { "option": misc.status.option() },
         "type": item.base_type,
@@ -766,7 +766,7 @@ mod tests {
         let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
 
         assert_eq!(body["query"]["type"], "Jewelled Foil");
-        assert_eq!(body["query"]["status"]["option"], "available");
+        assert_eq!(body["query"]["status"]["option"], "securable");
         assert_eq!(body["sort"]["price"], "asc");
         assert!(body["query"].get("name").is_none());
 
@@ -1094,14 +1094,36 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
             "true"
         );
 
-        // Default is Instant Buyout (status "available"), no corrupted filter.
+        // Default is Instant Buyout (status "securable"), no corrupted filter.
         let plain = build_search_body(&item, &[], &MiscFilters::default());
-        assert_eq!(plain["query"]["status"]["option"], "available");
+        assert_eq!(plain["query"]["status"]["option"], "securable");
         assert!(plain["query"].get("filters").is_none());
 
         assert_eq!(
             search_url("Standard", "abc123"),
             "https://www.pathofexile.com/trade/search/Standard/abc123"
         );
+    }
+
+    #[test]
+    fn instant_buyout_asks_for_securable_listings_only() {
+        let item = ParsedItem {
+            base_type: "Seaglass Amulet".to_string(),
+            ..Default::default()
+        };
+        let status_of = |status| {
+            let misc = MiscFilters { status, ..Default::default() };
+            build_search_body(&item, &[], &misc)["query"]["status"]["option"].clone()
+        };
+
+        // "available" is online-and-priced, which still returns in-person
+        // trades; the instant tier is "securable".
+        assert_eq!(status_of(Status::InstantBuyout), "securable");
+        assert_eq!(status_of(Status::Online), "online");
+        assert_eq!(status_of(Status::Any), "any");
+
+        assert_eq!(Status::InstantBuyout.next(), Status::Online);
+        assert_eq!(Status::Online.next(), Status::Any);
+        assert_eq!(Status::Any.next(), Status::InstantBuyout);
     }
 }
