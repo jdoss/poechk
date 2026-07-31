@@ -19,7 +19,13 @@ use crate::data::StatIndex;
 
 /// A rolled value, optionally followed by an advanced `(min-max)` annotation.
 static VALUE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([+-]?\d+(?:\.\d+)?)(?:\([^)]*\))?").unwrap());
+    LazyLock::new(|| Regex::new(r"([+-]?\d+(?:\.\d+)?)(?:\(([^)]*)\))?").unwrap());
+
+/// The two ends of an advanced annotation's roll range. Written to tolerate
+/// negative ends, where the separator and the sign are the same character:
+/// `-15--5` is -15 to -5.
+static RANGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([+-]?\d+(?:\.\d+)?)-([+-]?\d+(?:\.\d+)?)$").unwrap());
 
 /// Which affix bucket a mod line belongs to, matching the trade `ids` keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +123,11 @@ pub struct ParsedMod {
     /// The numeric rolls, in order. Empty for an option stat, whose text is
     /// picked from a list rather than rolled.
     pub rolls: Vec<f64>,
+    /// The lowest and highest roll this mod's tier can produce, averaged across
+    /// its values like `rolls` is. `None` when the copy format did not annotate
+    /// the rolls with their ranges.
+    #[serde(default)]
+    pub tier_range: Option<(f64, f64)>,
     /// Trade option id, for stats the trade site selects from a fixed list
     /// (cluster jewel enchants, "Allocates #", …) instead of a roll range.
     #[serde(default)]
@@ -151,51 +162,71 @@ impl ParsedMod {
     }
 }
 
-/// The `(start, end, value)` of each rolled value (and any annotation) in `line`.
-fn value_matches(line: &str) -> Vec<(usize, usize, f64)> {
+/// A rolled value in a mod line, with the span it occupies.
+#[derive(Debug, Clone, Copy)]
+struct Value {
+    start: usize,
+    end: usize,
+    roll: f64,
+    /// The tier's roll range, when the advanced format annotated this value.
+    range: Option<(f64, f64)>,
+}
+
+/// The roll range of an advanced annotation, or `None` when it is not one —
+/// `(augmented)` and `(Tier: 1)` both annotate without stating a range.
+fn parse_range(annotation: &str) -> Option<(f64, f64)> {
+    let caps = RANGE_RE.captures(annotation.trim())?;
+    let min = caps.get(1)?.as_str().parse::<f64>().ok()?;
+    let max = caps.get(2)?.as_str().parse::<f64>().ok()?;
+    Some((min, max))
+}
+
+/// Each rolled value in `line`, with its span and any annotated tier range.
+fn value_matches(line: &str) -> Vec<Value> {
     VALUE_RE
         .captures_iter(line)
         .filter_map(|caps| {
             let whole = caps.get(0)?;
-            let value = caps.get(1)?.as_str().parse::<f64>().ok()?;
-            Some((whole.start(), whole.end(), value))
+            Some(Value {
+                start: whole.start(),
+                end: whole.end(),
+                roll: caps.get(1)?.as_str().parse::<f64>().ok()?,
+                range: caps.get(2).and_then(|a| parse_range(a.as_str())),
+            })
         })
         .collect()
 }
 
 /// Build a template from `line`, replacing each value with `#` unless its index
-/// is in `keep_literal`. Returns the template and the templated (rolled) values.
-fn build_template(
-    line: &str,
-    nums: &[(usize, usize, f64)],
-    keep_literal: &[usize],
-) -> (String, Vec<f64>) {
+/// is in `keep_literal`. Returns the template and the templated values.
+fn build_template(line: &str, nums: &[Value], keep_literal: &[usize]) -> (String, Vec<Value>) {
     let mut result = String::new();
-    let mut rolls = Vec::new();
+    let mut values = Vec::new();
     let mut last = 0;
-    for (idx, &(start, end, value)) in nums.iter().enumerate() {
-        result.push_str(&line[last..start]);
+    for (idx, value) in nums.iter().enumerate() {
+        result.push_str(&line[last..value.start]);
         if keep_literal.contains(&idx) {
-            result.push_str(&line[start..end]);
+            result.push_str(&line[value.start..value.end]);
         } else {
             result.push('#');
-            rolls.push(value);
+            values.push(*value);
         }
-        last = end;
+        last = value.end;
     }
     result.push_str(&line[last..]);
-    (result, rolls)
+    (result, values)
 }
 
 /// Replace every rolled value (sign and any `(min-max)` annotation included)
 /// with `#`, returning the template and the extracted rolls.
 pub fn templatize(line: &str) -> (String, Vec<f64>) {
-    build_template(line, &value_matches(line), &[])
+    let (template, values) = build_template(line, &value_matches(line), &[]);
+    (template, values.iter().map(|v| v.roll).collect())
 }
 
 /// Candidate templates for a mod line, most-templated first: all values as `#`,
 /// then variants keeping one value literal (for stats like "per 10 Dexterity").
-fn candidates(line: &str) -> Vec<(String, Vec<f64>)> {
+fn candidates(line: &str) -> Vec<(String, Vec<Value>)> {
     let nums = value_matches(line);
     if nums.is_empty() {
         return vec![(line.to_string(), Vec::new())];
@@ -205,6 +236,30 @@ fn candidates(line: &str) -> Vec<(String, Vec<f64>)> {
         out.push(build_template(line, &nums, &[i]));
     }
     out
+}
+
+/// The tier range for a whole mod: each end averaged across its values, the way
+/// [`ParsedMod::roll`] averages the rolls, so `Adds 91(81-111) to 172(163-189)`
+/// yields 122 to 150 against a 131.5 roll.
+///
+/// `None` unless every value carried an annotation — the standard copy format
+/// prints none, and a half-known range would seed a floor from thin air.
+///
+/// `sign` mirrors the roll negation for "reduced" matchers, which swaps the ends.
+fn tier_range(values: &[Value], sign: f64) -> Option<(f64, f64)> {
+    if values.is_empty() {
+        return None;
+    }
+    let count = values.len() as f64;
+    let mut min = 0.0;
+    let mut max = 0.0;
+    for value in values {
+        let (low, high) = value.range?;
+        min += low * sign;
+        max += high * sign;
+    }
+    let (min, max) = (min / count, max / count);
+    Some(if min <= max { (min, max) } else { (max, min) })
 }
 
 /// Strip a trailing ` — <metadata>` tail (em-dash), e.g. "— Unscalable Value".
@@ -274,7 +329,14 @@ pub fn parse_mod(
             } else if candidate_rolls.is_empty() {
                 stat.value.map(|v| vec![v]).unwrap_or_default()
             } else {
-                candidate_rolls.iter().map(|roll| roll * sign).collect()
+                candidate_rolls.iter().map(|v| v.roll * sign).collect()
+            };
+            // Only a rolled mod has a tier to bound; an option stat picks from
+            // a list, and a stat-supplied value is not a roll of this item's.
+            let tier_range = if option.is_some() {
+                None
+            } else {
+                tier_range(&candidate_rolls, sign)
             };
             let explicit_ids = if key == "explicit" {
                 ids.clone()
@@ -295,6 +357,7 @@ pub fn parse_mod(
                 slot,
                 template: candidate.clone(),
                 rolls,
+                tier_range,
                 option,
                 lower_is_better: stat.lower_is_better,
                 stat_ref: stat.stat_ref.clone(),
@@ -310,6 +373,49 @@ pub fn parse_mod(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rolls_of(values: &[Value]) -> Vec<f64> {
+        values.iter().map(|v| v.roll).collect()
+    }
+
+    #[test]
+    fn an_annotated_roll_carries_the_range_its_tier_can_produce() {
+        let values = value_matches("Adds 91(81-111) to 172(163-189) Cold Damage");
+
+        assert_eq!(rolls_of(&values), vec![91.0, 172.0]);
+        assert_eq!(values[0].range, Some((81.0, 111.0)));
+        assert_eq!(values[1].range, Some((163.0, 189.0)));
+        // Averaged like the rolls are, so it bounds the same number the trade
+        // site filters "Adds # to #" on.
+        assert_eq!(tier_range(&values, 1.0), Some((122.0, 150.0)));
+    }
+
+    #[test]
+    fn an_unannotated_or_half_annotated_line_has_no_tier_range() {
+        // The standard copy format prints no ranges at all.
+        assert_eq!(tier_range(&value_matches("Adds 91 to 172 Cold Damage"), 1.0), None);
+        // A partial annotation would average a floor out of thin air.
+        assert_eq!(tier_range(&value_matches("Adds 91(81-111) to 172 Cold"), 1.0), None);
+        assert_eq!(tier_range(&[], 1.0), None);
+    }
+
+    #[test]
+    fn non_range_annotations_are_not_mistaken_for_tiers() {
+        assert_eq!(parse_range("81-111"), Some((81.0, 111.0)));
+        // Negative ends: the separator and the sign are the same character.
+        assert_eq!(parse_range("-15--5"), Some((-15.0, -5.0)));
+        assert_eq!(parse_range("augmented"), None);
+        assert_eq!(parse_range("Tier: 1"), None);
+        assert_eq!(parse_range("81"), None);
+    }
+
+    #[test]
+    fn negating_a_range_swaps_its_ends_so_the_floor_stays_the_floor() {
+        // "60% reduced" is stored as -60% increased, which turns a 40-60 tier
+        // into -60 to -40; the lower end has to stay the lower end.
+        let values = value_matches("60(40-60)% reduced Mana Cost");
+        assert_eq!(tier_range(&values, -1.0), Some((-60.0, -40.0)));
+    }
     use crate::data::load_stats;
 
     #[test]
@@ -331,12 +437,13 @@ mod tests {
             cands
                 .iter()
                 .any(|(t, r)| t == "#% increased Attack Speed per # Dexterity"
-                    && *r == vec![5.0, 10.0])
+                    && rolls_of(r) == vec![5.0, 10.0])
         );
         assert!(
             cands
                 .iter()
-                .any(|(t, r)| t == "#% increased Attack Speed per 10 Dexterity" && *r == vec![5.0])
+                .any(|(t, r)| t == "#% increased Attack Speed per 10 Dexterity"
+                    && rolls_of(r) == vec![5.0])
         );
     }
 

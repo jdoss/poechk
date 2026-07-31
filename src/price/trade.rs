@@ -370,16 +370,64 @@ pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
     item.mods
         .iter()
         .map(|m| {
-            let roll = m.roll();
             FilterSpec {
                 enabled: enabled && !matches!(m.mod_type, ModType::Crafted | ModType::Implicit),
                 as_explicit: false,
                 use_pseudo: !m.pseudo_ids.is_empty(),
-                min: roll.filter(|_| !m.lower_is_better).map(|r| round_outward(r, f64::floor)),
-                max: roll.filter(|_| m.lower_is_better).map(|r| round_outward(r, f64::ceil)),
+                min: (!m.lower_is_better).then(|| seed_bound(m, Bound::Floor)).flatten(),
+                max: m.lower_is_better.then(|| seed_bound(m, Bound::Cap)).flatten(),
             }
         })
         .collect()
+}
+
+/// Which end of the roll a seeded filter bounds.
+#[derive(Clone, Copy, PartialEq)]
+enum Bound {
+    Floor,
+    Cap,
+}
+
+/// How far past the roll to seed when the tier is unknown, as a fraction of it.
+const ROLL_MARGIN: f64 = 0.1;
+
+/// The bound to seed a filter with: the mod's tier limit when the copy carried
+/// it, else a margin past the roll.
+///
+/// Seeding the exact roll asks for items that match or beat this one on every
+/// enabled mod at once, which even a near-identical item fails — a dagger
+/// rolling `Adds 83 to 177 Cold Damage` averages 130 against this item's 131.5
+/// and drops out, though both are the same tier of the same mod. The tier limit
+/// asks what a price check means: this mod, at this tier.
+///
+/// The margin widens away from the roll in whichever direction is worse, so a
+/// negative roll still matches its own filter.
+fn seed_bound(m: &crate::item::mods::ParsedMod, bound: Bound) -> Option<f64> {
+    let roll = m.roll();
+    let direction: fn(f64) -> f64 = match bound {
+        Bound::Floor => f64::floor,
+        Bound::Cap => f64::ceil,
+    };
+    // An enchant is picked from a list rather than rolled inside a tier, so it
+    // has no near-miss to accommodate: a cluster jewel grants 8 passives or it
+    // does not, and widening the cap to 8.8 only obscures that.
+    if m.mod_type == ModType::Enchant {
+        return Some(round_outward(roll?, direction));
+    }
+    let limit = match (m.tier_range, bound) {
+        (Some((min, _)), Bound::Floor) => min,
+        (Some((_, max)), Bound::Cap) => max,
+        (None, Bound::Floor) => roll? - roll?.abs() * ROLL_MARGIN,
+        (None, Bound::Cap) => roll? + roll?.abs() * ROLL_MARGIN,
+    };
+    let widened = round_outward(limit, direction);
+    // A roll smaller than the margin rounds away to zero, which is no bound at
+    // all: 0.1% Life Regeneration would stop filtering on the roll entirely.
+    // There is nothing to widen into at that size, so keep the roll itself.
+    if widened == 0.0 && roll.is_some_and(|r| r != 0.0) {
+        return Some(round_outward(roll?, direction));
+    }
+    Some(widened)
 }
 
 /// Round a roll away from the item so the item itself still matches its own
@@ -715,6 +763,7 @@ mod tests {
             slot: None,
             template: stat_ref.to_string(),
             rolls: roll.map(|r| vec![r]).unwrap_or_default(),
+            tier_range: None,
             option: None,
             lower_is_better: false,
             stat_ref: stat_ref.to_string(),
@@ -722,6 +771,56 @@ mod tests {
             explicit_ids: vec![id.to_string()],
             pseudo_ids: vec![],
         }
+    }
+
+    /// The case from a real check: this dagger's `Adds 91 to 172 Cold Damage`
+    /// averages 131.5, and a listed dagger rolling `83 to 177` averages 130 —
+    /// the same mod at the same tier, dropped by seeding the exact roll.
+    #[test]
+    fn a_filter_seeds_the_mods_tier_floor_not_the_roll_it_happens_to_have() {
+        let mut cold = mod_with("Adds # to # Cold Damage", "explicit.stat_1037193709", None);
+        cold.rolls = vec![91.0, 172.0];
+        cold.tier_range = Some((122.0, 150.0));
+        let item = ParsedItem {
+            base_type: "Ambusher".to_string(),
+            rarity: Some(Rarity::Rare),
+            mods: vec![cold],
+            ..Default::default()
+        };
+
+        let seeded = default_filters(&item)[0].min.unwrap();
+        assert_eq!(seeded, 122.0);
+        assert!(seeded < 130.0, "a same-tier roll of 130 has to survive the filter");
+        assert!(seeded <= 131.5, "the item still matches its own filter");
+    }
+
+    #[test]
+    fn without_a_tier_the_filter_falls_back_to_a_margin_below_the_roll() {
+        let mut item = ParsedItem {
+            rarity: Some(Rarity::Rare),
+            mods: vec![mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(133.0))],
+            ..Default::default()
+        };
+        assert_eq!(default_filters(&item)[0].min, Some(119.7));
+
+        // The margin widens away from the roll whichever way it points, so a
+        // negative roll still matches the filter seeded from it.
+        item.mods = vec![mod_with("#% reduced Mana Cost", "explicit.stat_x", Some(-60.0))];
+        assert_eq!(default_filters(&item)[0].min, Some(-66.0));
+    }
+
+    #[test]
+    fn a_roll_too_small_to_widen_keeps_its_own_value() {
+        let mut item = ParsedItem {
+            rarity: Some(Rarity::Rare),
+            mods: vec![mod_with("Regenerate #% of Life", "explicit.stat_y", Some(0.1))],
+            ..Default::default()
+        };
+        // A tenth widened by a tenth rounds to zero, which is no filter at all.
+        assert_eq!(default_filters(&item)[0].min, Some(0.1));
+
+        item.mods[0].lower_is_better = true;
+        assert_eq!(default_filters(&item)[0].max, Some(0.2));
     }
 
     fn rare_dagger() -> ParsedItem {
@@ -748,7 +847,7 @@ mod tests {
         );
         assert!(body["query"].get("type").is_none());
         // The affixes still do the discriminating.
-        assert_eq!(body["query"]["stats"][0]["filters"][0]["value"]["min"], 70.0);
+        assert_eq!(body["query"]["stats"][0]["filters"][0]["value"]["min"], 63.0);
     }
 
     #[test]
@@ -856,7 +955,7 @@ mod tests {
         assert_eq!(filters[0]["disabled"], true);
         assert!(filters[0].get("value").is_none());
         assert_eq!(filters[2]["disabled"], false);
-        assert_eq!(filters[2]["value"]["min"], 133.0);
+        assert_eq!(filters[2]["value"]["min"], 119.7);
     }
 
     #[test]
@@ -990,7 +1089,9 @@ mod tests {
         assert_eq!(filters.len(), 2);
         assert_eq!(filters[0]["id"], "explicit.stat_210067635");
         assert_eq!(filters[0]["disabled"], false);
-        assert_eq!(filters[0]["value"]["min"], 30.0);
+        // Seeded a margin below the 30 roll: this copy carried no tier range,
+        // and the exact roll would ask for items that beat it outright.
+        assert_eq!(filters[0]["value"]["min"], 27.0);
         // Flag mod: filter by presence, no value.
         assert_eq!(filters[1]["id"], "crafted.stat_4126210832");
         assert!(filters[1].get("value").is_none());
@@ -1051,7 +1152,8 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
         assert!(granted["value"].get("option").is_none());
         assert!(granted["value"].get("min").is_none());
 
-        // Fewer added passives is better, so 8 is the cap, not the floor.
+        // Fewer added passives is better, so 8 is the cap, not the floor. An
+        // enchant is not widened: 8/8 stays 8/8.
         let passives = by_id("enchant.stat_3086156145");
         assert_eq!(passives["value"]["max"], 8.0);
         assert!(passives["value"].get("min").is_none());
