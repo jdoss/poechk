@@ -778,6 +778,8 @@ mod tests {
             slot: None,
             template: stat_ref.to_string(),
             rolls: roll.map(|r| vec![r]).unwrap_or_default(),
+            affix: None,
+            tier: None,
             tier_range: None,
             option: None,
             lower_is_better: false,

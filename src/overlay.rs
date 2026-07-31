@@ -734,6 +734,11 @@ impl Overlay {
             );
         }
         row = row.push(text(parsed.text.clone()).size(13.0).width(Length::Fill));
+        // The affix and its tier, when the advanced copy named them: enough to
+        // judge whether a mod is a T1 worth filtering on or filler.
+        if let Some(affix) = affix_label(parsed) {
+            row = row.push(text(affix).size(10.0).color(SECTION_COLOR));
+        }
         // An option mod (a cluster jewel enchant, an allocated notable) matches
         // by identity, so there is no range to type.
         if parsed.option.is_some() {
@@ -754,6 +759,19 @@ impl Overlay {
                 .width(Length::Fixed(56.0)),
         )
         .into()
+    }
+}
+
+/// The affix name and tier to show beside a mod, e.g. "Crystalising T1".
+///
+/// `None` when the copy named neither — an implicit has no affix, and the
+/// standard clipboard format carries no `{ … }` info lines at all.
+fn affix_label(parsed: &crate::item::mods::ParsedMod) -> Option<String> {
+    match (parsed.affix.as_deref(), parsed.tier) {
+        (Some(affix), Some(tier)) => Some(format!("{affix} T{tier}")),
+        (Some(affix), None) => Some(affix.to_string()),
+        (None, Some(tier)) => Some(format!("T{tier}")),
+        (None, None) => None,
     }
 }
 

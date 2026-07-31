@@ -46,7 +46,9 @@ pub fn run(copy: bool) -> anyhow::Result<()> {
     let stats = crate::data::load_stats();
     let items = crate::data::load_items();
 
-    let parsed = match item::parse::parse_item(&text, cfg.game, &stats, &items) {
+    let tiers = crate::item::tiers::load_tiers();
+
+    let mut parsed = match item::parse::parse_item(&text, cfg.game, &stats, &items) {
         Ok(parsed) => parsed,
         Err(e) => {
             log.event("parse_failed", json!({ "clipboard": text, "error": e.to_string() }));
@@ -56,6 +58,8 @@ pub fn run(copy: bool) -> anyhow::Result<()> {
             return Ok(());
         }
     };
+    // Fill in tiers the clipboard did not name, from the vendored ladder.
+    item::tiers::apply(&mut parsed, &tiers);
     log.event("parsed", json!({ "clipboard": text, "item": parsed }));
     tracing::info!(
         class = %parsed.item_class,

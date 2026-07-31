@@ -3,6 +3,7 @@
 pub mod mods;
 pub mod parse;
 pub mod pseudo;
+pub mod tiers;
 
 use serde::{Deserialize, Serialize};
 

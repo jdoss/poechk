@@ -56,6 +56,55 @@ pub fn trade_category(item: &ParsedItem) -> Option<&'static str> {
     Some(option)
 }
 
+/// The RePoE spawn tags for an item's class, most specific first, used to look
+/// up its affix tier ladder. Empty when the class rolls no prefix/suffix pool
+/// the ladder covers.
+///
+/// An item carries several tags at once — a dagger is a `dagger`, a
+/// `one_hand_weapon` and a `weapon` — and a mod is published against whichever
+/// one it spawns on, so a lookup has to try them all. Influence tags
+/// (`dagger_basilisk` and the rest) are deliberately absent: which influence an
+/// item carries is not parsed, and guessing would report tiers it cannot roll.
+///
+/// Distinct from [`trade_category`]: these name the game's own item tags, and
+/// the two vocabularies agree only by coincidence.
+pub fn spawn_tags(item: &ParsedItem) -> &'static [&'static str] {
+    let Some(category) = item.category.as_deref() else {
+        return &[];
+    };
+    match category {
+        "One-Handed Sword" if item.item_class == "Thrusting One Hand Swords" => {
+            &["rapier", "one_hand_weapon", "weapon"]
+        }
+        "One-Handed Sword" => &["sword", "one_hand_weapon", "weapon"],
+        "One-Handed Axe" => &["axe", "one_hand_weapon", "weapon"],
+        "One-Handed Mace" => &["mace", "one_hand_weapon", "weapon"],
+        "Sceptre" => &["sceptre", "one_hand_weapon", "weapon"],
+        "Dagger" => &["dagger", "one_hand_weapon", "weapon"],
+        "Rune Dagger" => &["rune_dagger", "dagger", "one_hand_weapon", "weapon"],
+        "Claw" => &["claw", "one_hand_weapon", "weapon"],
+        "Wand" => &["wand", "one_hand_weapon", "weapon", "ranged"],
+        "Two-Handed Sword" => &["two_hand_sword", "two_hand_weapon", "weapon"],
+        "Two-Handed Axe" => &["two_hand_axe", "two_hand_weapon", "weapon"],
+        "Two-Handed Mace" => &["two_hand_mace", "two_hand_weapon", "weapon"],
+        "Staff" => &["staff", "two_hand_weapon", "weapon"],
+        "Warstaff" => &["warstaff", "staff", "two_hand_weapon", "weapon"],
+        "Bow" => &["bow", "two_hand_weapon", "weapon", "ranged"],
+        "Body Armour" => &["body_armour", "armour"],
+        "Boots" => &["boots", "armour"],
+        "Gloves" => &["gloves", "armour"],
+        "Helmet" => &["helmet", "armour"],
+        "Shield" => &["shield", "armour"],
+        "Quiver" => &["quiver"],
+        "Amulet" => &["amulet"],
+        "Belt" => &["belt"],
+        "Ring" => &["ring"],
+        "Jewel" => &["jewel"],
+        "Abyss Jewel" => &["abyss_jewel"],
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -77,7 +77,7 @@ impl ModType {
 
     /// Read the mod type and affix slot from an advanced `{ … Modifier … }`
     /// info line. Returns `None` for anything that is not such a line.
-    pub fn from_info_line(line: &str) -> Option<(ModType, Option<Slot>)> {
+    pub fn from_info_line(line: &str) -> Option<ModInfo> {
         let inner = line.strip_prefix('{')?;
         let ty = if inner.contains("Implicit") {
             ModType::Implicit
@@ -97,8 +97,42 @@ impl ModType {
         } else {
             None
         };
-        Some((ty, slot))
+        Some(ModInfo {
+            mod_type: ty,
+            slot,
+            affix: quoted_name(inner),
+            tier: annotated_tier(inner),
+        })
     }
+}
+
+/// What an advanced `{ … }` info line says about the mod line beneath it.
+///
+/// `{ Fractured Prefix Modifier "Crystalising" (Tier: 1) — Damage, Cold }`
+/// names the affix and its tier; an implicit, an essence mod, and a
+/// master-crafted mod each carry less, so both are optional.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModInfo {
+    pub mod_type: ModType,
+    pub slot: Option<Slot>,
+    pub affix: Option<String>,
+    pub tier: Option<u32>,
+}
+
+/// The affix name an info line quotes, e.g. `"of Ferocity"`.
+fn quoted_name(inner: &str) -> Option<String> {
+    let (_, rest) = inner.split_once('"')?;
+    let (name, _) = rest.split_once('"')?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The tier an info line annotates. Only `Tier:` counts — a master-crafted
+/// mod's `Rank:` numbers bench recipes, not roll tiers, and the two would
+/// read as the same thing side by side.
+fn annotated_tier(inner: &str) -> Option<u32> {
+    let (_, rest) = inner.split_once("(Tier:")?;
+    let (digits, _) = rest.split_once(')')?;
+    digits.trim().parse().ok()
 }
 
 /// Whether an affix occupies a prefix or suffix slot (known only from the
@@ -118,6 +152,12 @@ pub struct ParsedMod {
     /// Prefix/suffix slot, when the advanced format's info line named it.
     #[serde(default)]
     pub slot: Option<Slot>,
+    /// The affix's name, when the advanced format's info line quoted one.
+    #[serde(default)]
+    pub affix: Option<String>,
+    /// The affix's tier, when the advanced format's info line annotated one.
+    #[serde(default)]
+    pub tier: Option<u32>,
     /// The matched template (rolls replaced by `#`).
     pub template: String,
     /// The numeric rolls, in order. Empty for an option stat, whose text is
@@ -285,12 +325,14 @@ pub fn line_body(line: &str) -> &str {
 pub fn parse_mod(
     line: &str,
     stats: &StatIndex,
-    context: Option<(ModType, Option<Slot>)>,
+    context: Option<&ModInfo>,
     category: Option<&str>,
 ) -> Option<ParsedMod> {
     let (suffix_type, rest) = ModType::from_suffix(line.trim());
     let body = strip_metadata(rest);
-    let (context_type, slot) = context.map_or((None, None), |(ty, slot)| (Some(ty), slot));
+    let (context_type, slot) =
+        context.map_or((None, None), |info| (Some(info.mod_type), info.slot));
+    let (affix, tier) = context.map_or((None, None), |info| (info.affix.clone(), info.tier));
     let mod_type = suffix_type.or(context_type).unwrap_or(ModType::Explicit);
     let key = mod_type.trade_key();
 
@@ -355,6 +397,8 @@ pub fn parse_mod(
                 text: body.to_string(),
                 mod_type,
                 slot,
+                affix: affix.clone(),
+                tier,
                 template: candidate.clone(),
                 rolls,
                 tier_range,
@@ -448,19 +492,43 @@ mod tests {
     }
 
     #[test]
-    fn from_info_line_reads_type_and_slot() {
-        assert_eq!(
-            ModType::from_info_line("{ Fractured Prefix Modifier \"Crystalising\" }"),
-            Some((ModType::Fractured, Some(Slot::Prefix)))
-        );
-        assert_eq!(
-            ModType::from_info_line("{ Master Crafted Prefix Modifier \"Upgraded\" }"),
-            Some((ModType::Crafted, Some(Slot::Prefix)))
-        );
-        assert_eq!(
-            ModType::from_info_line("{ Suffix Modifier \"of the Essence\" }"),
-            Some((ModType::Explicit, Some(Slot::Suffix)))
-        );
+    fn an_info_line_names_the_affix_and_its_tier() {
+        let info = ModType::from_info_line(
+            "{ Fractured Prefix Modifier \"Crystalising\" (Tier: 1) \u{2014} Damage, Cold }",
+        )
+        .expect("an info line parses");
+        assert_eq!(info.mod_type, ModType::Fractured);
+        assert_eq!(info.slot, Some(Slot::Prefix));
+        assert_eq!(info.affix.as_deref(), Some("Crystalising"));
+        assert_eq!(info.tier, Some(1));
+
+        let suffix = ModType::from_info_line("{ Suffix Modifier \"of Ferocity\" (Tier: 2) }")
+            .expect("a suffix parses");
+        assert_eq!(suffix.slot, Some(Slot::Suffix));
+        assert_eq!(suffix.affix.as_deref(), Some("of Ferocity"));
+        assert_eq!(suffix.tier, Some(2));
+    }
+
+    #[test]
+    fn info_lines_without_a_name_or_tier_still_type_the_mod() {
+        // An essence mod is named but untiered; an implicit is neither.
+        let essence = ModType::from_info_line("{ Suffix Modifier \"of the Essence\" }").unwrap();
+        assert_eq!(essence.affix.as_deref(), Some("of the Essence"));
+        assert_eq!(essence.tier, None);
+
+        let implicit = ModType::from_info_line("{ Implicit Modifier \u{2014} Critical }").unwrap();
+        assert_eq!(implicit.mod_type, ModType::Implicit);
+        assert_eq!(implicit.affix, None);
+        assert_eq!(implicit.tier, None);
+
+        // A bench recipe's rank is not a roll tier and must not read as one.
+        let crafted =
+            ModType::from_info_line("{ Master Crafted Prefix Modifier \"Upgraded\" (Rank: 3) }")
+                .unwrap();
+        assert_eq!(crafted.mod_type, ModType::Crafted);
+        assert_eq!(crafted.affix.as_deref(), Some("Upgraded"));
+        assert_eq!(crafted.tier, None);
+
         assert_eq!(ModType::from_info_line("+10 to Strength"), None);
     }
 
@@ -485,13 +553,19 @@ mod tests {
         let m = parse_mod(
             "Hits can't be Evaded \u{2014} Unscalable Value",
             &stats,
-            Some((ModType::Crafted, Some(Slot::Prefix))),
+            Some(&ModInfo {
+                mod_type: ModType::Crafted,
+                slot: Some(Slot::Prefix),
+                affix: Some("Upgraded".to_string()),
+                tier: None,
+            }),
             None,
         )
         .expect("crafted resolves");
         assert_eq!(m.mod_type, ModType::Crafted);
         assert_eq!(m.slot, Some(Slot::Prefix));
         assert_eq!(m.text, "Hits can't be Evaded");
+        assert_eq!(m.affix.as_deref(), Some("Upgraded"));
         assert!(m.trade_ids.iter().any(|id| id.starts_with("crafted.")));
     }
 
