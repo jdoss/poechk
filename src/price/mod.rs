@@ -1,5 +1,6 @@
 //! Pricing: the official trade/exchange APIs plus poe.ninja reference values.
 
+pub mod category;
 pub mod ninja;
 pub mod ratelimit;
 pub mod trade;

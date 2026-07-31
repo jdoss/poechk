@@ -134,6 +134,8 @@ struct Overlay {
     edps_min: String,
     status: Status,
     corrupted: Corrupted,
+    /// Search the exact base type rather than the item's class.
+    exact_base: bool,
     /// The trade-site URL for the last search, for "Open in browser".
     trade_url: Option<String>,
     search: SearchState,
@@ -157,6 +159,8 @@ enum Message {
     LeaguesLoaded(Vec<String>),
     CycleStatus,
     CycleCorrupted,
+    /// Narrow the search from the item's class to its exact base type.
+    ToggleExactBase,
     Search,
     OpenBrowser,
     Searched(SearchOutcome),
@@ -183,6 +187,7 @@ impl Message {
                 | Message::SetLeague(_)
                 | Message::CycleStatus
                 | Message::CycleCorrupted
+                | Message::ToggleExactBase
         )
     }
 }
@@ -283,6 +288,7 @@ impl Overlay {
             edps_min,
             status: Status::InstantBuyout,
             corrupted: Corrupted::Any,
+            exact_base: false,
             trade_url: None,
             search: SearchState::Idle,
         };
@@ -326,6 +332,10 @@ impl Overlay {
                 if let Some(row) = self.rows.get_mut(i) {
                     row.max = value;
                 }
+                Task::none()
+            }
+            Message::ToggleExactBase => {
+                self.exact_base = !self.exact_base;
                 Task::none()
             }
             Message::CycleCorrupted => {
@@ -439,7 +449,15 @@ impl Overlay {
             dps_min: self.dps_min.trim().parse().ok(),
             pdps_min: self.pdps_min.trim().parse().ok(),
             edps_min: self.edps_min.trim().parse().ok(),
+            exact_base: self.exact_base,
         }
+    }
+
+    /// The item's class name, when its class is one the trade site can be
+    /// searched by. `None` means the base type is the only search there is.
+    fn searchable_class(&self) -> Option<&str> {
+        crate::price::category::trade_category(&self.item)?;
+        self.item.category.as_deref()
     }
 
     fn view(&self, _id: window::Id) -> Element<'_, Message> {
@@ -592,6 +610,27 @@ impl Overlay {
                 );
         }
         col = col.push(controls);
+        // Its own row: "Class: One-Handed Sword" alongside the three controls
+        // above overruns the card. Only offered when the item has a class to
+        // widen to — for a map the base type is the search, with nothing to toggle.
+        if !bulk && let Some(class) = self.searchable_class() {
+            let (label, hint) = if self.exact_base {
+                (format!("Base: {}", item.base_type), "searching this base only")
+            } else {
+                (format!("Class: {class}"), "searching the whole class")
+            };
+            col = col.push(
+                Row::new()
+                    .spacing(8)
+                    .align_y(Vertical::Center)
+                    .push(
+                        button(text(label).size(13.0))
+                            .on_press(Message::ToggleExactBase)
+                            .padding([6, 10]),
+                    )
+                    .push(text(hint).size(11.0).color(SECTION_COLOR)),
+            );
+        }
         col = col.push(text("────────").size(10.0));
         col = col.push(results_view(&self.search));
         if self.trade_url.is_some() {
@@ -690,6 +729,9 @@ fn estimated_height(item: &ParsedItem) -> u32 {
         height += if parsed.text.len() > ROW_WRAP_CHARS { 46 } else { 28 };
     }
     height += 44; // Search / status / corrupted controls
+    if crate::price::category::trade_category(item).is_some() {
+        height += 40; // class / base type toggle row
+    }
     height += 130; // divider, results area, browser button, footer
     height.clamp(280, CARD_MAX_HEIGHT)
 }
@@ -958,6 +1000,7 @@ mod tests {
         let edits = [
             Message::CycleStatus,
             Message::CycleCorrupted,
+            Message::ToggleExactBase,
             Message::SetEnabled(0, false),
             Message::ToggleModType(0),
             Message::TogglePseudo(0),
