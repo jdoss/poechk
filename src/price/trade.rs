@@ -132,7 +132,7 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
 
     let mut query = json!({
         "status": { "option": misc.status.option() },
-        "stats": [ { "type": "and", "filters": stat_filters } ],
+        "stats": [ stat_group(stat_filters) ],
     });
     // Uniques are found by name; the base type alone is ambiguous.
     if item.rarity == Some(Rarity::Unique)
@@ -151,6 +151,31 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
     }
 
     json!({ "query": query, "sort": { "price": "asc" } })
+}
+
+/// How many affixes must be enabled before one may be spared. Below this each
+/// filter carries too much of the search to let a listing skip any.
+const SPARE_ONE_ABOVE: usize = 3;
+
+/// The `stats` group for a query: every enabled filter, or all but one of them.
+///
+/// Requiring every affix at once asks for an item strictly better than this one
+/// on all of them, which comparable listings routinely fail on a single mod —
+/// a dagger matching four of five is the price comparison, not a miss. The
+/// trade site's `count` group expresses that directly, so use it once there are
+/// enough filters that dropping one still describes the item.
+///
+/// Disabled rows ride along for the overlay's benefit and are not evaluated,
+/// so the count is over the enabled ones only.
+fn stat_group(filters: Vec<Value>) -> Value {
+    let enabled = filters
+        .iter()
+        .filter(|f| f["disabled"] == Value::Bool(false))
+        .count();
+    if enabled < SPARE_ONE_ABOVE {
+        return json!({ "type": "and", "filters": filters });
+    }
+    json!({ "type": "count", "value": { "min": enabled - 1 }, "filters": filters })
 }
 
 /// The trade category to search instead of the base type, or `None` to search
@@ -771,6 +796,60 @@ mod tests {
             explicit_ids: vec![id.to_string()],
             pseudo_ids: vec![],
         }
+    }
+
+    fn item_with_affixes(count: usize) -> ParsedItem {
+        ParsedItem {
+            base_type: "Ambusher".to_string(),
+            rarity: Some(Rarity::Rare),
+            mods: (0..count)
+                .map(|i| mod_with("+# to maximum Life", &format!("explicit.stat_{i}"), Some(50.0)))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The rest of the real dagger: five affixes at tier floors still found
+    /// nothing, because the one listing that compares has a crit multiplier
+    /// five tiers below this item's. Four of five is the price comparison.
+    #[test]
+    fn a_search_spares_one_affix_so_a_single_worse_mod_is_not_disqualifying() {
+        let item = item_with_affixes(5);
+        let group = &build_search_body(&item, &default_filters(&item), &MiscFilters::default())
+            ["query"]["stats"][0];
+
+        assert_eq!(group["type"], "count");
+        assert_eq!(group["value"]["min"], 4);
+        assert_eq!(group["filters"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn too_few_affixes_to_spare_one_are_all_required() {
+        for count in [1, 2] {
+            let item = item_with_affixes(count);
+            let group = &build_search_body(&item, &default_filters(&item), &MiscFilters::default())
+                ["query"]["stats"][0];
+
+            // With this little to go on, dropping one would stop describing the
+            // item at all.
+            assert_eq!(group["type"], "and", "{count} affixes");
+            assert!(group.get("value").is_none());
+        }
+    }
+
+    #[test]
+    fn only_enabled_affixes_count_toward_the_spare() {
+        let item = item_with_affixes(5);
+        let mut specs = default_filters(&item);
+        specs[3].enabled = false;
+        specs[4].enabled = false;
+        let group = &build_search_body(&item, &specs, &MiscFilters::default())["query"]["stats"][0];
+
+        // Three enabled of five rows: a disabled row is never evaluated, so
+        // counting it would silently spare two.
+        assert_eq!(group["type"], "count");
+        assert_eq!(group["value"]["min"], 2);
+        assert_eq!(group["filters"].as_array().unwrap().len(), 5);
     }
 
     /// The case from a real check: this dagger's `Adds 91 to 172 Cold Damage`
