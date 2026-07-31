@@ -109,6 +109,10 @@ pub struct MiscFilters {
     pub exact_base: bool,
 }
 
+/// The widening applied to every seeded filter unless the overlay says
+/// otherwise: one step, which reaches each mod's tier limit.
+pub const DEFAULT_WIDEN: f64 = 1.0;
+
 /// The outcome of a price search: the trade-site URL for it, the total match
 /// count, and the cheapest listings.
 #[derive(Debug, Clone)]
@@ -132,7 +136,7 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
 
     let mut query = json!({
         "status": { "option": misc.status.option() },
-        "stats": [ stat_group(stat_filters) ],
+        "stats": [ { "type": "and", "filters": stat_filters } ],
     });
     // Uniques are found by name; the base type alone is ambiguous.
     if item.rarity == Some(Rarity::Unique)
@@ -151,31 +155,6 @@ pub fn build_search_body(item: &ParsedItem, filters: &[FilterSpec], misc: &MiscF
     }
 
     json!({ "query": query, "sort": { "price": "asc" } })
-}
-
-/// How many affixes must be enabled before one may be spared. Below this each
-/// filter carries too much of the search to let a listing skip any.
-const SPARE_ONE_ABOVE: usize = 3;
-
-/// The `stats` group for a query: every enabled filter, or all but one of them.
-///
-/// Requiring every affix at once asks for an item strictly better than this one
-/// on all of them, which comparable listings routinely fail on a single mod —
-/// a dagger matching four of five is the price comparison, not a miss. The
-/// trade site's `count` group expresses that directly, so use it once there are
-/// enough filters that dropping one still describes the item.
-///
-/// Disabled rows ride along for the overlay's benefit and are not evaluated,
-/// so the count is over the enabled ones only.
-fn stat_group(filters: Vec<Value>) -> Value {
-    let enabled = filters
-        .iter()
-        .filter(|f| f["disabled"] == Value::Bool(false))
-        .count();
-    if enabled < SPARE_ONE_ABOVE {
-        return json!({ "type": "and", "filters": filters });
-    }
-    json!({ "type": "count", "value": { "min": enabled - 1 }, "filters": filters })
 }
 
 /// The trade category to search instead of the base type, or `None` to search
@@ -390,7 +369,11 @@ fn save_league_cache(ids: &[String]) {
 /// than its contribution to price usually warrants — an Exarch/Eater pair at
 /// roll can cut a body armour's matches to a single listing before any affix
 /// is considered — so they are offered as a choice rather than assumed.
-pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
+///
+/// `widen` scales how far past the roll each bound reaches: 0 pins the exact
+/// roll, 1 reaches the mod's tier limit, and beyond that goes proportionally
+/// further. See [`seed_bound`].
+pub fn default_filters(item: &ParsedItem, widen: f64) -> Vec<FilterSpec> {
     let enabled = item.rarity != Some(Rarity::Unique);
     item.mods
         .iter()
@@ -399,8 +382,8 @@ pub fn default_filters(item: &ParsedItem) -> Vec<FilterSpec> {
                 enabled: enabled && !matches!(m.mod_type, ModType::Crafted | ModType::Implicit),
                 as_explicit: false,
                 use_pseudo: !m.pseudo_ids.is_empty(),
-                min: (!m.lower_is_better).then(|| seed_bound(m, Bound::Floor)).flatten(),
-                max: m.lower_is_better.then(|| seed_bound(m, Bound::Cap)).flatten(),
+                min: (!m.lower_is_better).then(|| seed_bound(m, Bound::Floor, widen)).flatten(),
+                max: m.lower_is_better.then(|| seed_bound(m, Bound::Cap, widen)).flatten(),
             }
         })
         .collect()
@@ -413,21 +396,24 @@ enum Bound {
     Cap,
 }
 
-/// How far past the roll to seed when the tier is unknown, as a fraction of it.
+/// One widening step when the mod's tier is unknown, as a fraction of the roll.
 const ROLL_MARGIN: f64 = 0.1;
 
-/// The bound to seed a filter with: the mod's tier limit when the copy carried
-/// it, else a margin past the roll.
+/// The bound to seed a filter with, `widen` steps of the way from the roll to
+/// its tier limit.
 ///
 /// Seeding the exact roll asks for items that match or beat this one on every
 /// enabled mod at once, which even a near-identical item fails — a dagger
 /// rolling `Adds 83 to 177 Cold Damage` averages 130 against this item's 131.5
-/// and drops out, though both are the same tier of the same mod. The tier limit
-/// asks what a price check means: this mod, at this tier.
+/// and drops out, though both are the same tier of the same mod. One step out
+/// reaches the tier limit, which asks what a price check means: this mod, at
+/// this tier. Further widens proportionally; zero pins the roll itself.
 ///
-/// The margin widens away from the roll in whichever direction is worse, so a
-/// negative roll still matches its own filter.
-fn seed_bound(m: &crate::item::mods::ParsedMod, bound: Bound) -> Option<f64> {
+/// Without a tier (the standard copy format annotates nothing) a step is a
+/// tenth of the roll instead. Either way it widens away from the roll in
+/// whichever direction is worse, so a negative roll still matches its own
+/// filter.
+fn seed_bound(m: &crate::item::mods::ParsedMod, bound: Bound, widen: f64) -> Option<f64> {
     let roll = m.roll();
     let direction: fn(f64) -> f64 = match bound {
         Bound::Floor => f64::floor,
@@ -439,18 +425,22 @@ fn seed_bound(m: &crate::item::mods::ParsedMod, bound: Bound) -> Option<f64> {
     if m.mod_type == ModType::Enchant {
         return Some(round_outward(roll?, direction));
     }
-    let limit = match (m.tier_range, bound) {
-        (Some((min, _)), Bound::Floor) => min,
-        (Some((_, max)), Bound::Cap) => max,
-        (None, Bound::Floor) => roll? - roll?.abs() * ROLL_MARGIN,
-        (None, Bound::Cap) => roll? + roll?.abs() * ROLL_MARGIN,
+    let roll = roll?;
+    let step = match (m.tier_range, bound) {
+        (Some((min, _)), Bound::Floor) => roll - min,
+        (Some((_, max)), Bound::Cap) => max - roll,
+        (None, _) => roll.abs() * ROLL_MARGIN,
+    };
+    let limit = match bound {
+        Bound::Floor => roll - step * widen,
+        Bound::Cap => roll + step * widen,
     };
     let widened = round_outward(limit, direction);
-    // A roll smaller than the margin rounds away to zero, which is no bound at
+    // A roll smaller than the step rounds away to zero, which is no bound at
     // all: 0.1% Life Regeneration would stop filtering on the roll entirely.
     // There is nothing to widen into at that size, so keep the roll itself.
-    if widened == 0.0 && roll.is_some_and(|r| r != 0.0) {
-        return Some(round_outward(roll?, direction));
+    if widened == 0.0 && roll != 0.0 {
+        return Some(round_outward(roll, direction));
     }
     Some(widened)
 }
@@ -798,58 +788,61 @@ mod tests {
         }
     }
 
-    fn item_with_affixes(count: usize) -> ParsedItem {
-        ParsedItem {
+    #[test]
+    fn every_ticked_affix_has_to_match() {
+        let item = ParsedItem {
             base_type: "Ambusher".to_string(),
             rarity: Some(Rarity::Rare),
-            mods: (0..count)
+            mods: (0..5)
                 .map(|i| mod_with("+# to maximum Life", &format!("explicit.stat_{i}"), Some(50.0)))
                 .collect(),
             ..Default::default()
-        }
-    }
+        };
+        let defaults = default_filters(&item, DEFAULT_WIDEN);
+        let body = build_search_body(&item, &defaults, &MiscFilters::default());
+        let group = &body["query"]["stats"][0];
 
-    /// The rest of the real dagger: five affixes at tier floors still found
-    /// nothing, because the one listing that compares has a crit multiplier
-    /// five tiers below this item's. Four of five is the price comparison.
-    #[test]
-    fn a_search_spares_one_affix_so_a_single_worse_mod_is_not_disqualifying() {
-        let item = item_with_affixes(5);
-        let group = &build_search_body(&item, &default_filters(&item), &MiscFilters::default())
-            ["query"]["stats"][0];
-
-        assert_eq!(group["type"], "count");
-        assert_eq!(group["value"]["min"], 4);
+        // Which affixes match decides the price, not how many: a listing that
+        // skipped the one mod carrying the value would quote against an item
+        // that is not comparable. The checkboxes pick; the query requires.
+        assert_eq!(group["type"], "and");
+        assert!(group.get("value").is_none());
         assert_eq!(group["filters"].as_array().unwrap().len(), 5);
     }
 
     #[test]
-    fn too_few_affixes_to_spare_one_are_all_required() {
-        for count in [1, 2] {
-            let item = item_with_affixes(count);
-            let group = &build_search_body(&item, &default_filters(&item), &MiscFilters::default())
-                ["query"]["stats"][0];
+    fn widening_scales_from_the_exact_roll_out_past_the_tier() {
+        let mut cold = mod_with("Adds # to # Cold Damage", "explicit.stat_1037193709", None);
+        cold.rolls = vec![91.0, 172.0];
+        cold.tier_range = Some((122.0, 150.0));
+        let item = ParsedItem {
+            rarity: Some(Rarity::Rare),
+            mods: vec![cold],
+            ..Default::default()
+        };
+        let min_at = |widen| default_filters(&item, widen)[0].min.unwrap();
 
-            // With this little to go on, dropping one would stop describing the
-            // item at all.
-            assert_eq!(group["type"], "and", "{count} affixes");
-            assert!(group.get("value").is_none());
-        }
+        // The roll averages 131.5 and its tier floor is 122, so one step out
+        // is the tier and half a step is halfway to it.
+        assert_eq!(min_at(0.0), 131.5);
+        assert_eq!(min_at(0.5), 126.7);
+        assert_eq!(min_at(DEFAULT_WIDEN), 122.0);
+        assert_eq!(min_at(2.0), 112.5);
     }
 
     #[test]
-    fn only_enabled_affixes_count_toward_the_spare() {
-        let item = item_with_affixes(5);
-        let mut specs = default_filters(&item);
-        specs[3].enabled = false;
-        specs[4].enabled = false;
-        let group = &build_search_body(&item, &specs, &MiscFilters::default())["query"]["stats"][0];
+    fn widening_scales_the_fallback_margin_too() {
+        let item = ParsedItem {
+            rarity: Some(Rarity::Rare),
+            mods: vec![mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(100.0))],
+            ..Default::default()
+        };
+        let min_at = |widen| default_filters(&item, widen)[0].min.unwrap();
 
-        // Three enabled of five rows: a disabled row is never evaluated, so
-        // counting it would silently spare two.
-        assert_eq!(group["type"], "count");
-        assert_eq!(group["value"]["min"], 2);
-        assert_eq!(group["filters"].as_array().unwrap().len(), 5);
+        // No tier came off the clipboard, so a step is a tenth of the roll.
+        assert_eq!(min_at(0.0), 100.0);
+        assert_eq!(min_at(DEFAULT_WIDEN), 90.0);
+        assert_eq!(min_at(2.0), 80.0);
     }
 
     /// The case from a real check: this dagger's `Adds 91 to 172 Cold Damage`
@@ -867,7 +860,7 @@ mod tests {
             ..Default::default()
         };
 
-        let seeded = default_filters(&item)[0].min.unwrap();
+        let seeded = default_filters(&item, DEFAULT_WIDEN)[0].min.unwrap();
         assert_eq!(seeded, 122.0);
         assert!(seeded < 130.0, "a same-tier roll of 130 has to survive the filter");
         assert!(seeded <= 131.5, "the item still matches its own filter");
@@ -880,12 +873,12 @@ mod tests {
             mods: vec![mod_with("+# to maximum Life", "explicit.stat_3299347043", Some(133.0))],
             ..Default::default()
         };
-        assert_eq!(default_filters(&item)[0].min, Some(119.7));
+        assert_eq!(default_filters(&item, DEFAULT_WIDEN)[0].min, Some(119.7));
 
         // The margin widens away from the roll whichever way it points, so a
         // negative roll still matches the filter seeded from it.
         item.mods = vec![mod_with("#% reduced Mana Cost", "explicit.stat_x", Some(-60.0))];
-        assert_eq!(default_filters(&item)[0].min, Some(-66.0));
+        assert_eq!(default_filters(&item, DEFAULT_WIDEN)[0].min, Some(-66.0));
     }
 
     #[test]
@@ -896,10 +889,10 @@ mod tests {
             ..Default::default()
         };
         // A tenth widened by a tenth rounds to zero, which is no filter at all.
-        assert_eq!(default_filters(&item)[0].min, Some(0.1));
+        assert_eq!(default_filters(&item, DEFAULT_WIDEN)[0].min, Some(0.1));
 
         item.mods[0].lower_is_better = true;
-        assert_eq!(default_filters(&item)[0].max, Some(0.2));
+        assert_eq!(default_filters(&item, DEFAULT_WIDEN)[0].max, Some(0.2));
     }
 
     fn rare_dagger() -> ParsedItem {
@@ -916,7 +909,8 @@ mod tests {
     #[test]
     fn a_search_asks_for_the_item_class_rather_than_its_base_type() {
         let item = rare_dagger();
-        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+        let defaults = default_filters(&item, DEFAULT_WIDEN);
+        let body = build_search_body(&item, &defaults, &MiscFilters::default());
 
         // One base is too thin a market to price against, so the class is the
         // default and the base type drops out of the query entirely.
@@ -936,7 +930,7 @@ mod tests {
             exact_base: true,
             ..Default::default()
         };
-        let body = build_search_body(&item, &default_filters(&item), &misc);
+        let body = build_search_body(&item, &default_filters(&item, DEFAULT_WIDEN), &misc);
 
         assert_eq!(body["query"]["type"], "Ambusher");
         assert!(body["query"]["filters"].get("type_filters").is_none());
@@ -950,7 +944,7 @@ mod tests {
             dps_min: Some(400.0),
             ..Default::default()
         };
-        let body = build_search_body(&item, &default_filters(&item), &misc);
+        let body = build_search_body(&item, &default_filters(&item, DEFAULT_WIDEN), &misc);
         let groups = &body["query"]["filters"];
 
         assert_eq!(groups["type_filters"]["filters"]["category"]["option"], "weapon.basedagger");
@@ -1020,7 +1014,7 @@ mod tests {
             ..Default::default()
         };
 
-        let defaults = default_filters(&item);
+        let defaults = default_filters(&item, DEFAULT_WIDEN);
         assert!(!defaults[0].enabled, "implicits are the user's to opt into");
         assert!(!defaults[1].enabled);
         assert!(defaults[2].enabled, "explicit affixes still seed the search");
@@ -1054,7 +1048,7 @@ mod tests {
         };
 
         // Crafted mods default to disabled; normal explicits stay on.
-        let defaults = default_filters(&item);
+        let defaults = default_filters(&item, DEFAULT_WIDEN);
         assert!(defaults[0].enabled);
         assert!(!defaults[1].enabled);
 
@@ -1157,7 +1151,8 @@ mod tests {
             ..Default::default()
         };
 
-        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+        let defaults = default_filters(&item, DEFAULT_WIDEN);
+        let body = build_search_body(&item, &defaults, &MiscFilters::default());
 
         assert_eq!(body["query"]["type"], "Jewelled Foil");
         assert_eq!(body["query"]["status"]["option"], "securable");
@@ -1189,7 +1184,8 @@ mod tests {
             )],
             ..Default::default()
         };
-        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+        let defaults = default_filters(&item, DEFAULT_WIDEN);
+        let body = build_search_body(&item, &defaults, &MiscFilters::default());
         assert_eq!(body["query"]["name"], "Whispers of Infinity");
         assert_eq!(body["query"]["type"], "Seaglass Amulet");
         // Present but disabled, so the search returns every listing of the unique.
@@ -1215,7 +1211,8 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
         let item =
             crate::item::parse::parse_item(CLUSTER_JEWEL, crate::item::Game::Poe1, &stats, &items)
                 .unwrap();
-        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+        let defaults = default_filters(&item, DEFAULT_WIDEN);
+        let body = build_search_body(&item, &defaults, &MiscFilters::default());
 
         assert_eq!(body["query"]["type"], "Large Cluster Jewel");
         let filters = body["query"]["stats"][0]["filters"].as_array().unwrap();
@@ -1255,7 +1252,8 @@ Added Small Passive Skills grant: Minions deal 10% increased Damage (enchant)
             )],
             ..Default::default()
         };
-        let body = build_search_body(&item, &default_filters(&item), &MiscFilters::default());
+        let defaults = default_filters(&item, DEFAULT_WIDEN);
+        let body = build_search_body(&item, &defaults, &MiscFilters::default());
         // Flooring to a whole number would drop this roll out of the search.
         assert_eq!(body["query"]["stats"][0]["filters"][0]["value"]["min"], 0.1);
     }

@@ -88,11 +88,11 @@ Keyboard Shortcuts → Custom Shortcuts**:
    `Base: Ambusher` when the base itself is what you're selling. Items defined
    by their base — maps, flasks, cluster jewels — always search the base.
 
-   Affix filters are seeded to find comparable items, not strictly better ones.
-   Each is floored at its mod's tier rather than the exact roll, so a listing
-   rolling `83 to 177` still matches your `91 to 172`; and once three or more
-   are ticked, the search asks for all but one of them, so a single weaker mod
-   does not disqualify an otherwise comparable item.
+   Every ticked affix has to match — which ones you tick is what decides the
+   price, so nothing is dropped for you. Each is floored at its mod's tier
+   rather than at the exact roll, so a listing rolling `83 to 177` still
+   matches your `91 to 172`. The **Rolls** slider moves that floor: left pins
+   the exact roll, the default sits on the tier, right reaches past it.
 4. Cheapest listings show as price bands with the total match count.
    **Open in browser** lands on the same search on the trade site.
 5. **Esc** (or clicking away) closes the overlay.
