@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use crate::item::ParsedItem;
 use crate::item::mods::{ModType, ParsedMod};
+use crate::item::{Influence, ParsedItem};
 
 const TIERS_NDJSON: &str = include_str!("../../data/poe1/en/tiers.ndjson");
 
@@ -34,44 +34,64 @@ pub struct Tier {
 struct Ladder {
     #[serde(rename = "ref")]
     stat_ref: String,
-    tag: String,
+    category: String,
+    /// The influence that grants this affix; `None` for the ordinary pool.
+    influence: Option<Influence>,
     tiers: Vec<Tier>,
 }
 
-/// Affix tier ladders, keyed by stat ref and the item tag they roll on.
+/// Which pool an affix comes from: the class's own, or one an influence adds.
+type Pool = (String, String, Option<Influence>);
+
+/// Affix tier ladders, keyed by stat ref, item category, and influence.
 #[derive(Debug, Default)]
 pub struct TierIndex {
-    by_ref_and_tag: HashMap<(String, String), Vec<Tier>>,
+    by_pool: HashMap<Pool, Vec<Tier>>,
 }
 
 impl TierIndex {
-    /// The tiers of `stat_ref` on an item tagged `tag`, cheapest tier last.
-    pub fn ladder(&self, stat_ref: &str, tag: &str) -> Option<&[Tier]> {
-        self.by_ref_and_tag
-            .get(&(stat_ref.to_string(), tag.to_string()))
+    /// The tiers of `stat_ref` on `category`, from the pool `influence` opens.
+    pub fn ladder(
+        &self,
+        stat_ref: &str,
+        category: &str,
+        influence: Option<Influence>,
+    ) -> Option<&[Tier]> {
+        self.by_pool
+            .get(&(stat_ref.to_string(), category.to_string(), influence))
             .map(Vec::as_slice)
     }
 
-    /// The tier whose range contains `roll`, searching `tags` most-specific
-    /// first. `None` when no tier holds it — a corrupted or otherwise
-    /// out-of-band roll has no place on the ladder.
-    pub fn tier_of(&self, stat_ref: &str, tags: &[&str], roll: f64) -> Option<&Tier> {
-        tags.iter().find_map(|tag| {
-            self.ladder(stat_ref, tag)?
-                .iter()
-                .find(|t| roll >= t.min && roll <= t.max)
-        })
+    /// The tier whose range contains `roll`, looking through the class's own
+    /// pool first and then each influence the item carries.
+    ///
+    /// `None` when no tier holds it — a corrupted or otherwise out-of-band roll
+    /// has no place on the ladder.
+    pub fn tier_of(
+        &self,
+        stat_ref: &str,
+        category: &str,
+        influences: &[Influence],
+        roll: f64,
+    ) -> Option<&Tier> {
+        std::iter::once(None)
+            .chain(influences.iter().copied().map(Some))
+            .find_map(|influence| {
+                self.ladder(stat_ref, category, influence)?
+                    .iter()
+                    .find(|t| roll >= t.min && roll <= t.max)
+            })
     }
 }
 
 /// Load the vendored ladder.
 pub fn load_tiers() -> TierIndex {
-    let mut by_ref_and_tag = HashMap::new();
+    let mut by_pool = HashMap::new();
     let mut skipped = 0usize;
     for line in TIERS_NDJSON.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<Ladder>(line) {
             Ok(l) => {
-                by_ref_and_tag.insert((l.stat_ref, l.tag), l.tiers);
+                by_pool.insert((l.stat_ref, l.category, l.influence), l.tiers);
             }
             Err(_) => skipped += 1,
         }
@@ -79,7 +99,7 @@ pub fn load_tiers() -> TierIndex {
     if skipped > 0 {
         tracing::warn!(skipped, "skipped unparseable tier lines");
     }
-    TierIndex { by_ref_and_tag }
+    TierIndex { by_pool }
 }
 
 /// Fill in each affix's tier and tier range from the ladder, where the
@@ -89,10 +109,10 @@ pub fn load_tiers() -> TierIndex {
 /// not roll from the prefix/suffix pool the ladder describes, and matching one
 /// against it by stat text alone would report a tier it cannot have.
 pub fn apply(item: &mut ParsedItem, tiers: &TierIndex) {
-    let tags = crate::price::category::spawn_tags(item);
-    if tags.is_empty() {
+    let Some(category) = item.category.clone() else {
         return;
-    }
+    };
+    let influences = item.influences.clone();
     for m in &mut item.mods {
         if !matches!(m.mod_type, ModType::Explicit | ModType::Fractured) {
             continue;
@@ -100,7 +120,7 @@ pub fn apply(item: &mut ParsedItem, tiers: &TierIndex) {
         let Some(roll) = m.roll() else {
             continue;
         };
-        let Some(tier) = tiers.tier_of(&m.stat_ref, tags, roll) else {
+        let Some(tier) = tiers.tier_of(&m.stat_ref, &category, &influences, roll) else {
             continue;
         };
         fill_from(m, tier);
@@ -128,7 +148,7 @@ mod tests {
     fn the_vendored_ladder_loads_and_orders_daggers_cold_damage() {
         let tiers = load_tiers();
         let ladder = tiers
-            .ladder("Adds # to # Cold Damage", "dagger")
+            .ladder("Adds # to # Cold Damage", "Dagger", None)
             .expect("daggers roll added cold damage");
 
         // Tier 1 is the highest-level roll, the way the game numbers them.
@@ -144,13 +164,71 @@ mod tests {
         let tiers = load_tiers();
 
         // The roll this whole feature came from: 91-172 averages 131.5.
-        let t = tiers.tier_of("Adds # to # Cold Damage", &["dagger"], 131.5).unwrap();
+        let t = tiers.tier_of("Adds # to # Cold Damage", "Dagger", &[], 131.5).unwrap();
         assert_eq!((t.tier, t.name.as_str()), (1, "Crystalising"));
         // And the listing it kept missing, at 130.
-        assert_eq!(tiers.tier_of("Adds # to # Cold Damage", &["dagger"], 130.0).unwrap().tier, 1);
+        assert_eq!(tiers.tier_of("Adds # to # Cold Damage", "Dagger", &[], 130.0).unwrap().tier, 1);
         // A roll below every tier belongs to none of them.
-        assert!(tiers.tier_of("Adds # to # Cold Damage", &["dagger"], 0.5).is_none());
-        assert!(tiers.tier_of("Adds # to # Cold Damage", &["no-such-tag"], 131.5).is_none());
+        assert!(tiers.tier_of("Adds # to # Cold Damage", "Dagger", &[], 0.5).is_none());
+        assert!(tiers.tier_of("Adds # to # Cold Damage", "No Such Class", &[], 131.5).is_none());
+    }
+
+    #[test]
+    fn a_class_only_gets_the_affixes_its_spawn_weights_allow() {
+        let tiers = load_tiers();
+
+        // Affix names repeat across weapon classes, so the roll range is what
+        // distinguishes them. The one-hander's tier 1 adds 122-150 cold damage;
+        // the two-hander's own tier 1, of the same name, adds 224.5-276.
+        //
+        // Its weights open with two_hand_weapon:0 before sword:108, and the
+        // game stops at the first tag the item carries — so reading them as an
+        // unordered set hands a two-handed sword the one-hander's numbers.
+        let one_hander = tiers.ladder("Adds # to # Cold Damage", "Dagger", None).unwrap();
+        let two_hander = tiers
+            .ladder("Adds # to # Cold Damage", "Two-Handed Sword", None)
+            .unwrap();
+        assert_eq!((one_hander[0].min, one_hander[0].max), (122.0, 150.0));
+        assert_eq!((two_hander[0].min, two_hander[0].max), (224.5, 276.0));
+        // The same roll therefore places differently: top tier on a dagger,
+        // a mediocre one on a two-hander that rolls nearly twice as high.
+        let on_dagger = tiers.tier_of("Adds # to # Cold Damage", "Dagger", &[], 131.5).unwrap();
+        let on_two_hander = tiers
+            .tier_of("Adds # to # Cold Damage", "Two-Handed Sword", &[], 131.5)
+            .unwrap();
+        assert_eq!(on_dagger.tier, 1);
+        assert!(on_two_hander.tier > 1, "131.5 is not a two-hander's best roll");
+    }
+
+    #[test]
+    fn an_influence_opens_a_pool_the_class_does_not_have_on_its_own() {
+        let tiers = load_tiers();
+        let stat = "#% increased Chaos Damage over Time";
+
+        // Hunter influence is what puts this on a dagger at all.
+        assert!(tiers.ladder(stat, "Dagger", None).is_none());
+        assert!(tiers.ladder(stat, "Dagger", Some(Influence::Hunter)).is_some());
+        // And an uninfluenced dagger is never offered it.
+        assert!(tiers.tier_of(stat, "Dagger", &[], 90.0).is_none());
+        let t = tiers.tier_of(stat, "Dagger", &[Influence::Hunter], 90.0).unwrap();
+        assert_eq!((t.tier, t.name.as_str()), (1, "Hunter's"));
+    }
+
+    #[test]
+    fn a_veiled_affix_is_on_the_ladder_like_any_other() {
+        // "Chosen" unveils onto a dagger as an ordinary prefix, so it has the
+        // same tier ladder as one.
+        let tiers = load_tiers();
+        let t = tiers
+            .tier_of(
+                "Attacks with this Weapon Penetrate #% Elemental Resistances",
+                "Dagger",
+                &[],
+                16.0,
+            )
+            .expect("an unveiled prefix is still a prefix");
+        assert_eq!(t.name, "Chosen");
+        assert_eq!((t.min, t.max), (14.0, 16.0));
     }
 
     fn bare_mod() -> ParsedMod {
