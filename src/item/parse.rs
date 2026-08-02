@@ -8,7 +8,7 @@
 //! (suffix) and advanced (`{ … }` info line) clipboard formats.
 
 use crate::data::{ItemIndex, StatIndex};
-use crate::item::mods::{ModType, Slot};
+use crate::item::mods::ModType;
 use crate::item::{Game, Influence, ParsedItem, Rarity, mods};
 
 pub const ITEM_CLASS_PREFIX: &str = "Item Class: ";
@@ -137,7 +137,7 @@ pub fn parse_item(
 /// for the mods that follow, and every other line is resolved to a stat.
 fn parse_mod_section(section: &[&str], stats: &StatIndex, item: &mut ParsedItem) {
     let lines: Vec<&str> = section.iter().map(|l| l.trim()).collect();
-    let mut context: Option<(ModType, Option<Slot>)> = None;
+    let mut context: Option<mods::ModInfo> = None;
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
@@ -154,7 +154,7 @@ fn parse_mod_section(section: &[&str], stats: &StatIndex, item: &mut ParsedItem)
             continue;
         }
         let next = lines.get(index).copied();
-        match parse_mod_line(line, next, stats, context, item.category.as_deref()) {
+        match parse_mod_line(line, next, stats, context.as_ref(), item.category.as_deref()) {
             Some((parsed, took_next)) => {
                 item.mods.push(parsed);
                 index += usize::from(took_next);
@@ -172,7 +172,7 @@ fn parse_mod_line(
     line: &str,
     next: Option<&str>,
     stats: &StatIndex,
-    context: Option<(ModType, Option<Slot>)>,
+    context: Option<&mods::ModInfo>,
     category: Option<&str>,
 ) -> Option<(mods::ParsedMod, bool)> {
     if let Some(parsed) = mods::parse_mod(line, stats, context, category) {

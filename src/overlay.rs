@@ -16,7 +16,9 @@ use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerS
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     self, KeyboardInteractivity, Layer, get_layer_surface,
 };
-use cosmic::iced::widget::{Column, Row, button, checkbox, container, pick_list, text, text_input};
+use cosmic::iced::widget::{
+    Column, Row, button, checkbox, container, pick_list, slider, text, text_input,
+};
 use cosmic::iced::window;
 use cosmic::iced::{self, Color, Element, Length, Subscription, Task};
 
@@ -136,6 +138,9 @@ struct Overlay {
     corrupted: Corrupted,
     /// Search the exact base type rather than the item's class.
     exact_base: bool,
+    /// How far each seeded roll bound reaches past the roll, in steps to the
+    /// mod's tier limit. Re-seeds every row's min/max when moved.
+    widen: f64,
     /// The trade-site URL for the last search, for "Open in browser".
     trade_url: Option<String>,
     search: SearchState,
@@ -161,6 +166,8 @@ enum Message {
     CycleCorrupted,
     /// Narrow the search from the item's class to its exact base type.
     ToggleExactBase,
+    /// Re-seed every roll bound this far past its roll.
+    SetWiden(f64),
     Search,
     OpenBrowser,
     Searched(SearchOutcome),
@@ -188,6 +195,7 @@ impl Message {
                 | Message::CycleStatus
                 | Message::CycleCorrupted
                 | Message::ToggleExactBase
+                | Message::SetWiden(_)
         )
     }
 }
@@ -200,7 +208,7 @@ impl Overlay {
         // Fold total-res / total-life pseudo rows; their contributors start
         // disabled (the pseudo represents them, and matches spread rolls).
         let subsumed = crate::item::pseudo::fold_pseudo(&mut item);
-        let mut defaults = trade::default_filters(&item);
+        let mut defaults = trade::default_filters(&item, trade::DEFAULT_WIDEN);
         for &index in &subsumed {
             if let Some(spec) = defaults.get_mut(index) {
                 spec.enabled = false;
@@ -289,6 +297,7 @@ impl Overlay {
             status: Status::InstantBuyout,
             corrupted: Corrupted::Any,
             exact_base: false,
+            widen: trade::DEFAULT_WIDEN,
             trade_url: None,
             search: SearchState::Idle,
         };
@@ -336,6 +345,11 @@ impl Overlay {
             }
             Message::ToggleExactBase => {
                 self.exact_base = !self.exact_base;
+                Task::none()
+            }
+            Message::SetWiden(widen) => {
+                self.widen = widen;
+                self.reseed_bounds();
                 Task::none()
             }
             Message::CycleCorrupted => {
@@ -450,6 +464,43 @@ impl Overlay {
             pdps_min: self.pdps_min.trim().parse().ok(),
             edps_min: self.edps_min.trim().parse().ok(),
             exact_base: self.exact_base,
+        }
+    }
+
+    /// How far each seeded roll bound reaches past its roll. Which affixes
+    /// matter is the checkboxes' job — a listing has to match every ticked one.
+    fn roll_slider(&self) -> Element<'_, Message> {
+        let label = match self.widen {
+            w if w <= 0.0 => "exact rolls".to_string(),
+            w if (w - 1.0).abs() < f64::EPSILON => "tier rolls".to_string(),
+            w => format!("tier rolls ×{w:.2}"),
+        };
+        Row::new()
+            .spacing(8)
+            .align_y(Vertical::Center)
+            .push(text("Rolls").size(11.0).color(SECTION_COLOR).width(Length::Fixed(52.0)))
+            .push(
+                slider(0.0..=2.0, self.widen, Message::SetWiden)
+                    .step(0.25)
+                    .width(Length::Fixed(150.0)),
+            )
+            .push(text(label).size(11.0).color(SECTION_COLOR))
+            .into()
+    }
+
+    /// Re-seed every row's min/max at the current widening.
+    ///
+    /// Only the bounds: which rows are ticked, and whether each searches as its
+    /// own type or as a pseudo total, are the user's and survive the slider.
+    /// Hand-typed bounds do not — re-seeding is what the slider is for.
+    fn reseed_bounds(&mut self) {
+        for (row, spec) in self
+            .rows
+            .iter_mut()
+            .zip(trade::default_filters(&self.item, self.widen))
+        {
+            row.min = spec.min.map(fmt_amount).unwrap_or_default();
+            row.max = spec.max.map(fmt_amount).unwrap_or_default();
         }
     }
 
@@ -631,6 +682,9 @@ impl Overlay {
                     .push(text(hint).size(11.0).color(SECTION_COLOR)),
             );
         }
+        if !bulk {
+            col = col.push(self.roll_slider());
+        }
         col = col.push(text("────────").size(10.0));
         col = col.push(results_view(&self.search));
         if self.trade_url.is_some() {
@@ -680,6 +734,11 @@ impl Overlay {
             );
         }
         row = row.push(text(parsed.text.clone()).size(13.0).width(Length::Fill));
+        // The affix and its tier, when the advanced copy named them: enough to
+        // judge whether a mod is a T1 worth filtering on or filler.
+        if let Some(affix) = affix_label(parsed) {
+            row = row.push(text(affix).size(10.0).color(SECTION_COLOR));
+        }
         // An option mod (a cluster jewel enchant, an allocated notable) matches
         // by identity, so there is no range to type.
         if parsed.option.is_some() {
@@ -700,6 +759,19 @@ impl Overlay {
                 .width(Length::Fixed(56.0)),
         )
         .into()
+    }
+}
+
+/// The affix name and tier to show beside a mod, e.g. "Crystalising T1".
+///
+/// `None` when the copy named neither — an implicit has no affix, and the
+/// standard clipboard format carries no `{ … }` info lines at all.
+fn affix_label(parsed: &crate::item::mods::ParsedMod) -> Option<String> {
+    match (parsed.affix.as_deref(), parsed.tier) {
+        (Some(affix), Some(tier)) => Some(format!("{affix} T{tier}")),
+        (Some(affix), None) => Some(affix.to_string()),
+        (None, Some(tier)) => Some(format!("T{tier}")),
+        (None, None) => None,
     }
 }
 
@@ -729,6 +801,7 @@ fn estimated_height(item: &ParsedItem) -> u32 {
         height += if parsed.text.len() > ROW_WRAP_CHARS { 46 } else { 28 };
     }
     height += 44; // Search / status / corrupted controls
+    height += 26; // roll-widening slider
     if crate::price::category::trade_category(item).is_some() {
         height += 40; // class / base type toggle row
     }

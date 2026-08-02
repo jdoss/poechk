@@ -3,6 +3,7 @@
 pub mod mods;
 pub mod parse;
 pub mod pseudo;
+pub mod tiers;
 
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +51,7 @@ impl Rarity {
 }
 
 /// An item influence (the "Shaper Item" / "Elder Item" / … lines).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Influence {
     Shaper,
     Elder,
